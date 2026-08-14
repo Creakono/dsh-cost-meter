@@ -1,0 +1,23 @@
+/* Cost readout line under the composer card, visually matching the shipped
+ * stats line it follows (same column width, type size, and tertiary tone). */
+
+.root {
+  display: flex;
+  justify-content: center;
+  align-items: baseline;
+  gap: 6px;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: var(--dsh-chat-content-width);
+  margin: 0 auto;
+  padding: 2px calc(var(--dsh-composer-side-clearance) + 16px) 0;
+  color: var(--dsw-alias-label-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  font-size: 12px;
+  line-height: 20px;
+}
+
+.value {
+  font-variant-numeric: tabular-nums;
+}
