@@ -1,4 +1,7 @@
 # dsh-cost-meter
+![License](https://img.shields.io/badge/license-MIT-blue)
+![Version](https://img.shields.io/badge/version-0.1.0-2ea44f)
+![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
 
 *既然都知道输入输出的token数目了，为什么不自动计算价格呢？*
 
@@ -15,7 +18,7 @@ DeepSeek Harness（DSH）Web 插件：在对话统计行（缓存命中率 / 输
 花费 =（缓存命中 × 命中价 + 缓存未命中 × 未命中价 + 输出 × 输出价）/ 1,000,000。
 按**当前会话所选模型**的价格档计算；未在表中列出的模型使用「默认价格」。
 
-*注意，当前版本仅实现了最基础的即时计算，对于峰谷计算与切换模型不生效。*
+*注意，当前版本仅实现了最基础的最终即时计算，对于峰谷计算与道中突然切换模型的情况不生效。*
 
 ## 出厂价格
 
@@ -54,12 +57,17 @@ DeepSeek Harness（DSH）Web 插件：在对话统计行（缓存命中率 / 输
 cd <harness 目录>
 # 本地源码（link 方式）
 dsh plugin --profile web add "link:<dsh-cost-meter 目录>"
-
 # 发布到 registry 后
 dsh plugin --profile web add dsh-cost-meter
 ```
 
-随后重启 web 服务端（或重新运行 harness 的启动命令），刷新页面即可。
+或者直接在 `.dsh\profiles\web\node_modules` 下运行：
+
+```
+git clone git@github.com:Creakono/dsh-cost-meter.git
+```
+
+随后重启 web 服务端，刷新页面即可。
 如果通过 pnpm 脚本启动 harness，插件命令同样写为 `pnpm dsh plugin ...`。
 
 ## 构建
