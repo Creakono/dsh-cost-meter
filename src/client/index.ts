@@ -2,12 +2,11 @@
  * dsh-cost-meter browser half:
  *
  * - `CostDock` — one entry in `conversation.composer.dock` (order 1, right
- *   after the shipped stats line at order 0) that appends the session's
- *   estimated cost, computed from the `tokenUsage` projection and the price
- *   tier for the session's current model (per-model, with a `default`
- *   fallback);
+ *   after the shipped stats line at order 0) that displays the sum of the
+ *   session's durable per-step cost ledger and a live peak-time warning;
  * - `CostSettingsSection` — one Settings page (`settings.section`) editing the
- *   currency, the fallback tier, and the per-model price tiers.
+ *   currency, the fallback tier, and per-model prices with optional
+ *   multi-window peak pricing.
  *
  * The price table is read/written over this plugin's own same-origin routes
  * (`/dsh-cost-meter/*`), because the api-proxy settings allowlist does not
@@ -120,6 +119,7 @@ export function apply(ctx: ClientContext): void {
         } catch { /* unknown session: fall back to the default tier */ }
       }
       return {
+        sessionId,
         useConfig,
         useModel: () => useSyncExternalStore(
           directoryStore !== undefined ? directoryStore.subscribe : noopSubscribe,

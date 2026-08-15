@@ -198,6 +198,7 @@
 .select:disabled,
 .input:disabled,
 .nameInput:disabled,
+.timeInput:disabled,
 .addButton:disabled,
 .removeButton:disabled {
   opacity: 0.6;
@@ -207,6 +208,7 @@
 .select:focus-visible,
 .input:focus-visible,
 .nameInput:focus-visible,
+.timeInput:focus-visible,
 .button:focus-visible,
 .addButton:focus-visible,
 .removeButton:focus-visible {
@@ -224,4 +226,72 @@
   font-size: 13px;
   line-height: 20px;
   color: var(--dsw-alias-color-danger, var(--dsw-alias-label-primary));
+}
+
+.modelBlock {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px 0 10px;
+}
+
+.modelBlock + .modelBlock {
+  border-top: 1px dashed var(--dsw-alias-border-l2);
+}
+
+.priceGroupLabel {
+  flex: none;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--dsw-alias-label-caption);
+}
+
+.toggleRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.toggleRow input {
+  margin: 0;
+  accent-color: var(--dsw-alias-label-primary);
+}
+
+.peakBlock {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 0 0 12px;
+  border-left: 2px solid var(--dsw-alias-border-l2);
+}
+
+.peakWindowRow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.timeCell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.timeInput {
+  box-sizing: border-box;
+  width: 110px;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  background: transparent;
+  font: inherit;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--dsw-alias-label-primary);
+  font-variant-numeric: tabular-nums;
 }

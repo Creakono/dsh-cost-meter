@@ -1,12 +1,19 @@
 /**
- * dsh-cost-meter host half: the local per-model pricing table behind the
- * estimated-cost readout appended to the chat stats line.
+ * dsh-cost-meter host half: the local per-model pricing table (with optional
+ * peak-time branches), the per-session cost ledger stored in a DSH
+ * storage-domain sidecar, and the same-origin routes the browser half reads.
  *
  * Prices are keyed by model id, with a `default` fallback tier; every value is
  * per 1,000,000 tokens in one billing currency (CNY = ¥ / USD = $). The row's
  * cordis config supplies the `base` layer of the settings namespace
  * (`dsh-cost-meter`); the user's settings document layers over it, so price
  * edits persist in `$DSH_HOME/settings.yaml` and hot-reload.
+ *
+ * Cost accounting is NOT a live projection: every billed step committed after
+ * this plugin version is installed is stored as an immutable entry (tokens,
+ * model, peak window, price snapshot, cost) in the `dsh-cost-meter` storage
+ * domain, keyed by session. The browser sums those entries; archiving a
+ * session deletes its row.
  *
  * The web api-proxy only exposes a hardcoded settings allowlist (product and
  * model-provider namespaces) to the browser, so a third-party namespace is
@@ -21,9 +28,18 @@
 import z from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { CostConfig, PriceTier } from './pricing.ts'
+import {
+  CostLedgerRuntime,
+  type StorageDomainLike,
+  type WorkspaceRegistryLike,
+} from './ledger-runtime.ts'
+
+export { CURRENCY_SYMBOLS } from './pricing.ts'
+export type { CostConfig, PeakWindow, PriceTier } from './pricing.ts'
 
 /**
- * Structural faces of the two host services this plugin consumes. Declared
+ * Structural faces of the host services this plugin consumes. Declared
  * locally (rather than importing the harness packages) so the host half stays
  * self-contained: the loader resolves them as injected services, not imports.
  */
@@ -47,6 +63,8 @@ declare module '@deepseek-ai/cordis' {
   interface Context {
     settings: SettingsProviderLike
     webServer: WebServerLike
+    storageDomain: StorageDomainLike
+    workspaceRegistry?: WorkspaceRegistryLike
   }
 }
 
@@ -62,51 +80,40 @@ export const CURRENCIES = ['CNY', 'USD'] as const
 /** A billing currency accepted by the price table. */
 export type Currency = typeof CURRENCIES[number]
 
-/** Currency display symbols used by the browser half. */
-export const CURRENCY_SYMBOLS: Record<Currency, string> = {
-  CNY: '\u00a5',
-  USD: '$',
-}
-
-/** One price tier: every price is per 1,000,000 tokens, in the table currency. */
-export interface PriceTier {
-  /** Input cache-hit price per 1M tokens. */
-  cacheHitPrice: number
-  /** Input cache-miss price per 1M tokens (cache writes bill at this rate too). */
-  cacheMissPrice: number
-  /** Output price per 1M tokens. */
-  outputPrice: number
-}
-
-/** Local price table: a fallback tier plus per-model overrides. */
-export interface CostConfig {
-  /** Billing currency (CNY = ¥, USD = $). */
-  currency: Currency
-  /** Fallback tier for models absent from `models`. */
-  default: PriceTier
-  /** Per-model tiers keyed by provider-owned model id. */
-  models: Record<string, PriceTier>
-}
+/** Local `HH:mm` window time. */
+const TIME_SCHEMA = z.string().pattern(/^([01]\d|2[0-3]):[0-5]\d$/)
 
 /**
  * Shipped default pricing, in CNY per 1M tokens. The `default` tier mirrors
  * `deepseek-v4-pro` (input hit ¥0.025 / input miss ¥3 / output ¥6), and
- * `models` seeds the two current DeepSeek V4 models.
+ * `models` seeds the two current DeepSeek V4 models. No peak branch ships
+ * enabled.
  */
 export const DEFAULT_COST_CONFIG: CostConfig = {
   currency: 'CNY',
-  default: { cacheHitPrice: 0.025, cacheMissPrice: 3, outputPrice: 6 },
+  default: { cacheHitPrice: 0.025, cacheMissPrice: 3, outputPrice: 6, peakWindows: [] },
   models: {
-    'deepseek-v4-flash': { cacheHitPrice: 0.02, cacheMissPrice: 1, outputPrice: 2 },
-    'deepseek-v4-pro': { cacheHitPrice: 0.025, cacheMissPrice: 3, outputPrice: 6 },
+    'deepseek-v4-flash': { cacheHitPrice: 0.02, cacheMissPrice: 1, outputPrice: 2, peakWindows: [] },
+    'deepseek-v4-pro': { cacheHitPrice: 0.025, cacheMissPrice: 3, outputPrice: 6, peakWindows: [] },
   },
 }
 
-/** Per-model price tier schema (each field defaults to 0 when absent). */
+/** One optional peak-time branch, editable per model. */
+const PeakWindowSchema = z.object({
+  id: z.string().pattern(/^[A-Za-z0-9._:-]+$/).required(),
+  start: TIME_SCHEMA.required(),
+  end: TIME_SCHEMA.required(),
+  cacheHitPrice: z.number().min(0).default(0),
+  cacheMissPrice: z.number().min(0).default(0),
+  outputPrice: z.number().min(0).default(0),
+})
+
+/** Per-model price tier schema (each price field defaults to 0 when absent). */
 const PriceSchema = z.object({
   cacheHitPrice: z.number().min(0).default(0),
   cacheMissPrice: z.number().min(0).default(0),
   outputPrice: z.number().min(0).default(0),
+  peakWindows: z.array(PeakWindowSchema).default([]),
 })
 
 /**
@@ -175,9 +182,9 @@ function migrateLegacySection(scope: SettingsScopeLike): void {
 }
 
 /**
- * Register the settings namespace (persistence in settings.yaml) and the
- * browser-facing config routes. `scope.replace` validates the incoming section
- * against {@link Config}, so a malformed write is refused before persistence.
+ * Register the settings namespace (persistence in settings.yaml), mount the
+ * optional storage-domain ledger child, and serve the browser-facing config
+ * and ledger routes.
  * @param ctx - host context.
  * @param config - validated cordis row config.
  */
@@ -192,6 +199,22 @@ export function apply(ctx: Context, config: CostConfig): void {
     base: { currency: config.currency, default: config.default },
   })
   migrateLegacySection(scope)
+
+  // Optional child: the sidecar ledger mounts only where storage-domain is
+  // present. The ledger route below reports it unavailable otherwise.
+  let ledgerRuntime: CostLedgerRuntime | undefined
+  ctx.inject(['storageDomain'], (ledgerCtx) => {
+    ledgerCtx.effect(() => {
+      const runtime = new CostLedgerRuntime(ledgerCtx, () => scope.get())
+      ledgerRuntime = runtime
+      runtime.open()
+      return () => {
+        if (ledgerRuntime === runtime) ledgerRuntime = undefined
+        return runtime.dispose()
+      }
+    }, 'dsh-cost-meter: cost ledger')
+  })
+
   ctx.effect(() => ctx.webServer.register({
     kind: 'prefix',
     path: '/dsh-cost-meter',
@@ -206,6 +229,18 @@ export function apply(ctx: Context, config: CostConfig): void {
           try {
             const body = await readJsonBody(req, MAX_BODY_BYTES)
             if (!isPlainObject(body)) throw new Error('a JSON object body is required')
+            const current = scope.get()
+            const requestedCurrency = body.currency
+            const nextCurrency: typeof CURRENCIES[number] =
+              requestedCurrency === 'CNY' || requestedCurrency === 'USD'
+                ? requestedCurrency
+                : DEFAULT_COST_CONFIG.currency
+            if (current !== undefined
+              && nextCurrency !== current.currency
+              && ledgerRuntime !== undefined
+              && await ledgerRuntime.hasForeignEntries(nextCurrency)) {
+              throw new Error(`cannot change currency: existing cost entries were billed in ${current.currency}`)
+            }
             await scope.replace(body)
             sendJson(res, 200, { ok: true, value: scope.get() })
           } catch (error) {
@@ -225,6 +260,40 @@ export function apply(ctx: Context, config: CostConfig): void {
         })()
         return
       }
+
+      // GET /dsh-cost-meter/sessions/:sessionId/ledger
+      const ledgerMatch = /^\/dsh-cost-meter\/sessions\/([^/]+)\/ledger\/?$/.exec(url)
+      if (req.method === 'GET' && ledgerMatch !== null) {
+        void (async () => {
+          try {
+            let sessionId: string
+            try {
+              sessionId = decodeURIComponent(ledgerMatch[1]!)
+            } catch {
+              throw new Error('invalid session id encoding')
+            }
+            if (sessionId === '' || sessionId.includes('/') || sessionId.includes('\\')) {
+              throw new Error('invalid session id')
+            }
+            if (ledgerRuntime === undefined) {
+              sendJson(res, 503, { ok: false, error: 'cost ledger is unavailable in this assembly' })
+              return
+            }
+            const result = await ledgerRuntime.read(sessionId)
+            if (result.kind === 'unavailable') {
+              sendJson(res, 503, { ok: false, error: 'cost ledger is unavailable' })
+            } else if (result.kind === 'archived') {
+              sendJson(res, 200, { ok: true, sessionId, archived: true, value: null })
+            } else {
+              sendJson(res, 200, { ok: true, sessionId, value: result.snapshot })
+            }
+          } catch (error) {
+            sendJson(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) })
+          }
+        })()
+        return
+      }
+
       res.writeHead(404)
       res.end()
     },

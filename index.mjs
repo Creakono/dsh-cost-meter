@@ -4,7 +4,7 @@ function isNullable(value) {
 	return value === null || value === void 0;
 }
 /** Return true for non-array object values. */
-function isPlainObject$1(data) {
+function isPlainObject$2(data) {
 	return data && typeof data === "object" && !Array.isArray(data);
 }
 /** Filter object entries and return a new object. */
@@ -644,7 +644,7 @@ Schema.extend("array", (data, { inner, meta }, options) => {
 	return [data.map((_, index) => property(data, index, inner, options))];
 });
 Schema.extend("dict", (data, { inner, sKey }, options, strict) => {
-	if (!isPlainObject$1(data)) throw new ValidationError(`expected object but got ${data}`, options);
+	if (!isPlainObject$2(data)) throw new ValidationError(`expected object but got ${data}`, options);
 	const result = {};
 	for (const key in data) {
 		let rKey;
@@ -674,7 +674,7 @@ function merge(result, data) {
 	}
 }
 Schema.extend("object", (data, { dict }, options, strict) => {
-	if (!isPlainObject$1(data)) throw new ValidationError(`expected object but got ${data}`, options);
+	if (!isPlainObject$2(data)) throw new ValidationError(`expected object but got ${data}`, options);
 	const result = {};
 	for (const key in dict) {
 		const value = property(data, key, dict[key], options);
@@ -703,7 +703,7 @@ Schema.extend("intersect", (data, { list, toString }, options, strict) => {
 		else if (typeof value === "object") merge(result ??= {}, value);
 		else if (result !== value) throw new ValidationError(`expected ${toString()} but got ${JSON.stringify(data)}`, options);
 	}
-	if (!strict && isPlainObject$1(data)) merge(result, data);
+	if (!strict && isPlainObject$2(data)) merge(result, data);
 	return [result];
 });
 Schema.extend("transform", (data, { inner, callback, preserve }, options) => {
@@ -790,16 +790,502 @@ defineMethod("transform", [
 	"preserve"
 ], ({ inner }, isInner) => inner.toString(isInner));
 //#endregion
+//#region src/pricing.ts
+/** Currency display symbols used by the browser half. */
+const CURRENCY_SYMBOLS = {
+	CNY: "¥",
+	USD: "$"
+};
+/** Minutes since local midnight. */
+function minutesOfTime(time) {
+	const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(time);
+	if (match === null) return NaN;
+	return Number(match[1]) * 60 + Number(match[2]);
+}
+/** True when `time` (epoch ms, local time) is inside the `[start, end)` window. */
+function isInWindow(time, start, end) {
+	const startMinutes = minutesOfTime(start);
+	const endMinutes = minutesOfTime(end);
+	if (!Number.isFinite(startMinutes) || !Number.isFinite(endMinutes) || startMinutes === endMinutes) return false;
+	const date = new Date(time);
+	const minutes = date.getHours() * 60 + date.getMinutes();
+	if (startMinutes < endMinutes) return minutes >= startMinutes && minutes < endMinutes;
+	return minutes >= startMinutes || minutes < endMinutes;
+}
+/**
+* The active peak window for one tier at `time` (epoch ms, local time).
+* @param tier - the tier whose windows are checked.
+* @param time - billing instant.
+* @returns the first matching window, or null.
+*/
+function activePeakWindow(tier, time) {
+	for (const window of tier.peakWindows) if (isInWindow(time, window.start, window.end)) return window;
+	return null;
+}
+/**
+* Resolve the price tier for one model at one billing instant: its table
+* entry when present (with peak windows applied), the `default` fallback
+* otherwise.
+* @param config - the local price table.
+* @param model - provider-owned model id, or null/undefined when unknown.
+* @param time - billing instant (epoch ms, local time).
+* @returns the applicable tier and the matched peak window, if any.
+*/
+function resolveTierAt(config, model, time) {
+	const base = model !== null && model !== void 0 && config.models[model] !== void 0 ? config.models[model] : config.default;
+	const peakWindow = activePeakWindow(base, time);
+	return peakWindow === null ? {
+		tier: base,
+		peakWindow: null
+	} : {
+		tier: peakWindow,
+		peakWindow
+	};
+}
+/**
+* Estimate a cost from provider usage and one price tier. Cache reads bill
+* at the cache-hit price; uncached input and cache writes bill at the
+* cache-miss price.
+* @param usage - one step's `tokenUsage` buckets.
+* @param tier - the price tier (per 1M tokens).
+* @returns the per-bucket and total cost.
+*/
+function estimateCost(usage, tier) {
+	const cacheHitTokens = usage.cacheReadTokens;
+	const cacheMissTokens = usage.uncachedInputTokens + usage.cacheWriteTokens;
+	const outputTokens = usage.outputTokens;
+	const cacheHitCost = cacheHitTokens * tier.cacheHitPrice / 1e6;
+	const cacheMissCost = cacheMissTokens * tier.cacheMissPrice / 1e6;
+	const outputCost = outputTokens * tier.outputPrice / 1e6;
+	return {
+		cacheHitTokens,
+		cacheMissTokens,
+		outputTokens,
+		cacheHitCost,
+		cacheMissCost,
+		outputCost,
+		totalCost: cacheHitCost + cacheMissCost + outputCost
+	};
+}
+//#endregion
+//#region src/ledger.ts
+/**
+* Host-side cost ledger vocabulary and pure math. The ledger records one
+* immutable price entry per model step billed after this plugin version was
+* installed (no backfill). Each entry snapshots the token buckets, the model,
+* the peak window (if any), the prices actually used, and the resulting cost.
+*
+* The storage-domain record schema is validated by a plain `parse` object so
+* the host bundle stays self-contained (no zod import).
+*/
+const ENTRY_PREFIX = "t:";
+/** Stable record key for one turn/step. */
+function entryKey(turn, step) {
+	return `${ENTRY_PREFIX}${turn}:${step}`;
+}
+/** Extract the provider usage carried by one committed event, if any. */
+function usageSampleOf(event) {
+	const data = event.data;
+	if (data === null || data === void 0) return null;
+	const usage = event.type === "assistant/chunk" && data.chunk?.type === "usage" ? data.chunk?.usage : event.type === "assistant/message" ? data.usage : void 0;
+	if (usage === void 0) return null;
+	const turn = Number(data.turn);
+	const step = Number(data.step);
+	const buckets = bucketsOf(usage);
+	if (buckets === null || !Number.isSafeInteger(turn) || turn < 0 || !Number.isSafeInteger(step) || step < 0) return null;
+	return {
+		turn,
+		step,
+		buckets
+	};
+}
+function bucketsOf(usage) {
+	if (!isPlainObject$1(usage)) return null;
+	const value = usage;
+	const uncachedInputTokens = nonNegativeNumber(value.inputTokens);
+	const outputTokens = nonNegativeNumber(value.outputTokens);
+	const cacheReadTokens = nonNegativeNumber(value.cacheReadTokens ?? 0);
+	const cacheWriteTokens = nonNegativeNumber(value.cacheWriteTokens ?? 0);
+	if (uncachedInputTokens === null || outputTokens === null || cacheReadTokens === null || cacheWriteTokens === null) return null;
+	return {
+		uncachedInputTokens,
+		outputTokens,
+		cacheReadTokens,
+		cacheWriteTokens
+	};
+}
+/** The model id carried by a `request/header` event, if any. */
+function modelOf(event) {
+	if (event.type !== "request/header") return null;
+	const model = event.data?.header?.config?.model;
+	return typeof model === "string" && model !== "" ? model : null;
+}
+/** Seed a fold from the committed prefix WITHOUT generating entries (no backfill). */
+function seedFold(events, untilSeq) {
+	let model = null;
+	for (const event of events) {
+		if (event.seq >= untilSeq) break;
+		const next = modelOf(event);
+		if (next !== null) model = next;
+	}
+	return { model };
+}
+/** Fold one new event's model state (no entry generation here). */
+function foldModel(state, event) {
+	const model = modelOf(event);
+	return model === null || model === state.model ? state : { model };
+}
+/**
+* Build the immutable cost entry for one usage sample at its own event time.
+*/
+function buildCostEntry(config, model, sample, time) {
+	const { tier, peakWindow } = resolveTierAt(config, model, time);
+	const breakdown = estimateCost(sample.buckets, tier);
+	return {
+		turn: sample.turn,
+		step: sample.step,
+		time,
+		model,
+		currency: config.currency,
+		peakWindowId: peakWindow?.id ?? null,
+		prices: {
+			cacheHitPrice: tier.cacheHitPrice,
+			cacheMissPrice: tier.cacheMissPrice,
+			outputPrice: tier.outputPrice
+		},
+		tokens: {
+			cacheHitTokens: breakdown.cacheHitTokens,
+			cacheMissTokens: breakdown.cacheMissTokens,
+			outputTokens: breakdown.outputTokens
+		},
+		costs: {
+			cacheHitCost: breakdown.cacheHitCost,
+			cacheMissCost: breakdown.cacheMissCost,
+			outputCost: breakdown.outputCost,
+			totalCost: breakdown.totalCost
+		}
+	};
+}
+/** True when two entries carry the same billed facts (avoids a no-op write). */
+function sameEntry(left, right) {
+	return left.turn === right.turn && left.step === right.step && left.time === right.time && left.model === right.model && left.currency === right.currency && left.peakWindowId === right.peakWindowId && left.prices.cacheHitPrice === right.prices.cacheHitPrice && left.prices.cacheMissPrice === right.prices.cacheMissPrice && left.prices.outputPrice === right.prices.outputPrice && left.tokens.cacheHitTokens === right.tokens.cacheHitTokens && left.tokens.cacheMissTokens === right.tokens.cacheMissTokens && left.tokens.outputTokens === right.tokens.outputTokens && left.costs.cacheHitCost === right.costs.cacheHitCost && left.costs.cacheMissCost === right.costs.cacheMissCost && left.costs.outputCost === right.costs.outputCost && left.costs.totalCost === right.costs.totalCost;
+}
+/** Replace (or insert) one step entry in a record; same reference when unchanged. */
+function applyEntry(record, entry) {
+	const key = entryKey(entry.turn, entry.step);
+	const current = record.entries[key];
+	if (current !== void 0 && sameEntry(current, entry)) return record;
+	return {
+		...record,
+		entries: {
+			...record.entries,
+			[key]: entry
+		}
+	};
+}
+/** Read-side snapshot: sorted entries plus summed buckets and costs. */
+function snapshotRecord(record) {
+	const entries = Object.values(record?.entries ?? {}).sort((a, b) => a.time - b.time || a.turn - b.turn || a.step - b.step);
+	const snapshot = {
+		entries,
+		tokens: {
+			cacheHitTokens: 0,
+			cacheMissTokens: 0,
+			outputTokens: 0
+		},
+		costs: {
+			cacheHitCost: 0,
+			cacheMissCost: 0,
+			outputCost: 0,
+			totalCost: 0
+		}
+	};
+	for (const entry of entries) {
+		snapshot.tokens.cacheHitTokens += entry.tokens.cacheHitTokens;
+		snapshot.tokens.cacheMissTokens += entry.tokens.cacheMissTokens;
+		snapshot.tokens.outputTokens += entry.tokens.outputTokens;
+		snapshot.costs.cacheHitCost += entry.costs.cacheHitCost;
+		snapshot.costs.cacheMissCost += entry.costs.cacheMissCost;
+		snapshot.costs.outputCost += entry.costs.outputCost;
+		snapshot.costs.totalCost += entry.costs.totalCost;
+	}
+	return snapshot;
+}
+/**
+* Structural domain spec accepted by `ctx.storageDomain.open`. The record
+* `parse` validates stored rows by hand, so this package imports no zod.
+*/
+const LEDGER_DOMAIN_SPEC = {
+	name: "dsh_cost_meter",
+	version: 1,
+	tables: { sessions: { valueSchema: { parse(raw) {
+		return parseSessionCostRecord(raw);
+	} } } }
+};
+function parseSessionCostRecord(raw) {
+	if (!isPlainObject$1(raw)) throw new Error("cost-ledger session record must be an object");
+	const value = raw;
+	if (typeof value.sessionId !== "string" || value.sessionId === "") throw new Error("cost-ledger session record has no sessionId");
+	if (!isPlainObject$1(value.entries)) throw new Error("cost-ledger session record entries must be an object");
+	const entries = {};
+	for (const [key, rawEntry] of Object.entries(value.entries)) entries[key] = parseCostEntry(rawEntry);
+	return {
+		sessionId: value.sessionId,
+		entries
+	};
+}
+function parseCostEntry(raw) {
+	if (!isPlainObject$1(raw)) throw new Error("cost-ledger entry must be an object");
+	const value = raw;
+	const turn = nonNegativeInteger(value.turn, "turn");
+	const step = nonNegativeInteger(value.step, "step");
+	const time = finiteNumber(value.time, "time");
+	if (time < 0) throw new Error("cost-ledger entry time must be non-negative");
+	if (value.model !== null && typeof value.model !== "string") throw new Error("cost-ledger entry model must be a string or null");
+	if (value.currency !== "CNY" && value.currency !== "USD") throw new Error("cost-ledger entry currency must be CNY or USD");
+	if (value.peakWindowId !== null && typeof value.peakWindowId !== "string") throw new Error("cost-ledger entry peakWindowId must be a string or null");
+	if (!isPlainObject$1(value.tokens)) throw new Error("cost-ledger entry tokens must be an object");
+	const tokens = value.tokens;
+	return {
+		turn,
+		step,
+		time,
+		model: value.model,
+		currency: value.currency,
+		peakWindowId: value.peakWindowId,
+		prices: {
+			cacheHitPrice: nonNegativePrice(value, "prices.cacheHitPrice"),
+			cacheMissPrice: nonNegativePrice(value, "prices.cacheMissPrice"),
+			outputPrice: nonNegativePrice(value, "prices.outputPrice")
+		},
+		tokens: {
+			cacheHitTokens: nonNegativeInteger(tokens.cacheHitTokens, "tokens.cacheHitTokens"),
+			cacheMissTokens: nonNegativeInteger(tokens.cacheMissTokens, "tokens.cacheMissTokens"),
+			outputTokens: nonNegativeInteger(tokens.outputTokens, "tokens.outputTokens")
+		},
+		costs: {
+			cacheHitCost: nonNegativePrice(value, "costs.cacheHitCost"),
+			cacheMissCost: nonNegativePrice(value, "costs.cacheMissCost"),
+			outputCost: nonNegativePrice(value, "costs.outputCost"),
+			totalCost: nonNegativePrice(value, "costs.totalCost")
+		}
+	};
+}
+function isPlainObject$1(value) {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function nonNegativeNumber(value) {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+function finiteNumber(value, field) {
+	if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`cost-ledger ${field} must be a finite number`);
+	return value;
+}
+function nonNegativeInteger(value, field) {
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new Error(`cost-ledger ${field} must be a non-negative integer`);
+	return value;
+}
+function nonNegativePrice(value, field) {
+	const nested = field.split(".");
+	let current = value;
+	for (const key of nested) {
+		if (!isPlainObject$1(current)) throw new Error(`cost-ledger ${field} must be a non-negative number`);
+		current = current[key];
+	}
+	const parsed = nonNegativeNumber(current);
+	if (parsed === null) throw new Error(`cost-ledger ${field} must be a non-negative number`);
+	return parsed;
+}
+//#endregion
+//#region src/ledger-runtime.ts
+/**
+* Runtime half of the per-session cost ledger. It owns the storage-domain
+* sidecar table, listens to committed session events, and writes one immutable
+* price entry per billed step (only steps committed after this plugin version
+* is installed — no backfill). It also reconciles archived sessions and
+* deletes their ledger records.
+*/
+/** Archive reconciliation interval. */
+const ARCHIVE_RECONCILE_MS = 3e4;
+/**
+* The ledger runtime for one mounted plugin instance. Event observation is
+* synchronous; every storage write is queued per session so read-modify-write
+* updates of one session never interleave.
+*/
+var CostLedgerRuntime = class {
+	ctx;
+	readConfig;
+	domain;
+	table;
+	ready;
+	opened = false;
+	closed = false;
+	stopEvent;
+	archiveTimer;
+	folds = /* @__PURE__ */ new WeakMap();
+	tails = /* @__PURE__ */ new Map();
+	allTails = /* @__PURE__ */ new Set();
+	constructor(ctx, readConfig) {
+		this.ctx = ctx;
+		this.readConfig = readConfig;
+	}
+	/** Open the sidecar domain and start observing committed session events. */
+	open() {
+		if (this.opened) return;
+		this.opened = true;
+		this.ready = this.ctx.storageDomain.open(LEDGER_DOMAIN_SPEC).then((domain) => {
+			if (this.closed) return domain.close().then(() => void 0);
+			this.domain = domain;
+			this.table = domain.table("sessions");
+		}).catch((error) => {
+			this.ctx.logger.warn(`dsh-cost-meter: cost ledger domain unavailable: ${String(error)}`);
+			throw error;
+		});
+		this.stopEvent = this.ctx.on("session/event", (session, event) => {
+			this.onEvent(session, event);
+		});
+		this.archiveTimer = setInterval(() => {
+			this.reconcileArchived();
+		}, ARCHIVE_RECONCILE_MS);
+	}
+	/** Stop observing, drain queued writes, and close the sidecar domain. */
+	async dispose() {
+		this.closed = true;
+		this.stopEvent?.();
+		this.stopEvent = void 0;
+		if (this.archiveTimer !== void 0) clearInterval(this.archiveTimer);
+		await this.ready?.catch(() => void 0);
+		await Promise.allSettled([...this.allTails]);
+		await this.domain?.close();
+		this.domain = void 0;
+		this.table = void 0;
+	}
+	/** Read one session's ledger, deleting the row first when the session is archived. */
+	async read(sessionId) {
+		if (this.table === void 0) try {
+			await this.ready;
+		} catch {
+			return { kind: "unavailable" };
+		}
+		if (this.closed || this.table === void 0) return { kind: "unavailable" };
+		if (this.isArchived(sessionId)) {
+			await this.deleteSession(sessionId);
+			return { kind: "archived" };
+		}
+		return {
+			kind: "ready",
+			snapshot: snapshotRecord(this.table.get(sessionId))
+		};
+	}
+	/**
+	* True when any durable entry was billed in a currency different from
+	* `currency`. Used to refuse currency switches once billing has started:
+	* immutable snapshots in two currencies cannot be summed meaningfully.
+	*/
+	async hasForeignEntries(currency) {
+		if (this.closed) return false;
+		if (this.table === void 0) try {
+			await this.ready;
+		} catch {
+			return false;
+		}
+		if (this.closed || this.table === void 0) return false;
+		for (const key of this.table.keys()) {
+			const record = this.table.get(key);
+			if (record === void 0) continue;
+			for (const entry of Object.values(record.entries)) if (entry.currency !== currency) return true;
+		}
+		return false;
+	}
+	/** Delete ledger rows for every session currently in the archive set. */
+	async reconcileArchived() {
+		if (this.closed) return;
+		if (this.table === void 0) try {
+			await this.ready;
+		} catch {
+			return;
+		}
+		if (this.closed || this.table === void 0) return;
+		const archived = this.ctx.get("workspaceRegistry")?.archivedSessionIds;
+		if (archived === void 0 || archived.length === 0) return;
+		const archivedSet = new Set(archived);
+		const victims = [];
+		for (const key of this.table.keys()) if (archivedSet.has(key)) victims.push(key);
+		await Promise.all(victims.map((sessionId) => this.deleteSession(sessionId)));
+	}
+	onEvent(session, event) {
+		if (this.closed) return;
+		let state = this.folds.get(session);
+		if (state === void 0) state = seedFold(session.events, event.seq);
+		const next = foldModel(state, event);
+		if (next !== state) this.folds.set(session, next);
+		const sample = usageSampleOf(event);
+		if (sample === null) return;
+		const config = this.readConfig();
+		if (config === void 0) return;
+		const entry = buildCostEntry(config, next.model, sample, event.time);
+		this.enqueue(session.id, async () => {
+			if (this.closed) return;
+			try {
+				await this.ready;
+			} catch {
+				return;
+			}
+			if (this.table === void 0) return;
+			const current = this.table.get(session.id) ?? {
+				sessionId: session.id,
+				entries: {}
+			};
+			const updated = applyEntry(current, entry);
+			if (updated !== current) await this.table.put(session.id, updated);
+		});
+	}
+	/** Serialize one session's ledger mutations (per-session tail; the domain chain also serializes). */
+	enqueue(sessionId, job) {
+		const settled = (this.tails.get(sessionId) ?? Promise.resolve()).then(job, job).catch((error) => {
+			this.ctx.logger.warn(`dsh-cost-meter: ledger write for "${sessionId}" failed: ${String(error)}`);
+		});
+		this.tails.set(sessionId, settled);
+		this.allTails.add(settled);
+		settled.finally(() => {
+			if (this.tails.get(sessionId) === settled) this.tails.delete(sessionId);
+			this.allTails.delete(settled);
+		});
+		return settled;
+	}
+	async deleteSession(sessionId) {
+		await this.enqueue(sessionId, async () => {
+			if (this.closed) return;
+			try {
+				await this.ready;
+			} catch {
+				return;
+			}
+			if (this.table !== void 0) await this.table.delete(sessionId);
+		});
+	}
+	isArchived(sessionId) {
+		return this.ctx.get("workspaceRegistry")?.archivedSessionIds.includes(sessionId) ?? false;
+	}
+};
+//#endregion
 //#region src/index.ts
 /**
-* dsh-cost-meter host half: the local per-model pricing table behind the
-* estimated-cost readout appended to the chat stats line.
+* dsh-cost-meter host half: the local per-model pricing table (with optional
+* peak-time branches), the per-session cost ledger stored in a DSH
+* storage-domain sidecar, and the same-origin routes the browser half reads.
 *
 * Prices are keyed by model id, with a `default` fallback tier; every value is
 * per 1,000,000 tokens in one billing currency (CNY = ¥ / USD = $). The row's
 * cordis config supplies the `base` layer of the settings namespace
 * (`dsh-cost-meter`); the user's settings document layers over it, so price
 * edits persist in `$DSH_HOME/settings.yaml` and hot-reload.
+*
+* Cost accounting is NOT a live projection: every billed step committed after
+* this plugin version is installed is stored as an immutable entry (tokens,
+* model, peak window, price snapshot, cost) in the `dsh-cost-meter` storage
+* domain, keyed by session. The browser sums those entries; archiving a
+* session deletes its row.
 *
 * The web api-proxy only exposes a hardcoded settings allowlist (product and
 * model-provider namespaces) to the browser, so a third-party namespace is
@@ -817,41 +1303,52 @@ const name = "dsh-cost-meter";
 const SETTINGS_NAMESPACE = "dsh-cost-meter";
 /** Accepted billing currencies (CNY = ¥, USD = $). */
 const CURRENCIES = ["CNY", "USD"];
-/** Currency display symbols used by the browser half. */
-const CURRENCY_SYMBOLS = {
-	CNY: "¥",
-	USD: "$"
-};
+/** Local `HH:mm` window time. */
+const TIME_SCHEMA = Schema.string().pattern(/^([01]\d|2[0-3]):[0-5]\d$/);
 /**
 * Shipped default pricing, in CNY per 1M tokens. The `default` tier mirrors
 * `deepseek-v4-pro` (input hit ¥0.025 / input miss ¥3 / output ¥6), and
-* `models` seeds the two current DeepSeek V4 models.
+* `models` seeds the two current DeepSeek V4 models. No peak branch ships
+* enabled.
 */
 const DEFAULT_COST_CONFIG = {
 	currency: "CNY",
 	default: {
 		cacheHitPrice: .025,
 		cacheMissPrice: 3,
-		outputPrice: 6
+		outputPrice: 6,
+		peakWindows: []
 	},
 	models: {
 		"deepseek-v4-flash": {
 			cacheHitPrice: .02,
 			cacheMissPrice: 1,
-			outputPrice: 2
+			outputPrice: 2,
+			peakWindows: []
 		},
 		"deepseek-v4-pro": {
 			cacheHitPrice: .025,
 			cacheMissPrice: 3,
-			outputPrice: 6
+			outputPrice: 6,
+			peakWindows: []
 		}
 	}
 };
-/** Per-model price tier schema (each field defaults to 0 when absent). */
-const PriceSchema = Schema.object({
+/** One optional peak-time branch, editable per model. */
+const PeakWindowSchema = Schema.object({
+	id: Schema.string().pattern(/^[A-Za-z0-9._:-]+$/).required(),
+	start: TIME_SCHEMA.required(),
+	end: TIME_SCHEMA.required(),
 	cacheHitPrice: Schema.number().min(0).default(0),
 	cacheMissPrice: Schema.number().min(0).default(0),
 	outputPrice: Schema.number().min(0).default(0)
+});
+/** Per-model price tier schema (each price field defaults to 0 when absent). */
+const PriceSchema = Schema.object({
+	cacheHitPrice: Schema.number().min(0).default(0),
+	cacheMissPrice: Schema.number().min(0).default(0),
+	outputPrice: Schema.number().min(0).default(0),
+	peakWindows: Schema.array(PeakWindowSchema).default([])
 });
 /**
 * The price-table schema: the cordis Config (validated for the loader row)
@@ -911,9 +1408,9 @@ function migrateLegacySection(scope) {
 	});
 }
 /**
-* Register the settings namespace (persistence in settings.yaml) and the
-* browser-facing config routes. `scope.replace` validates the incoming section
-* against {@link Config}, so a malformed write is refused before persistence.
+* Register the settings namespace (persistence in settings.yaml), mount the
+* optional storage-domain ledger child, and serve the browser-facing config
+* and ledger routes.
 * @param ctx - host context.
 * @param config - validated cordis row config.
 */
@@ -923,6 +1420,18 @@ function apply(ctx, config) {
 		default: config.default
 	} });
 	migrateLegacySection(scope);
+	let ledgerRuntime;
+	ctx.inject(["storageDomain"], (ledgerCtx) => {
+		ledgerCtx.effect(() => {
+			const runtime = new CostLedgerRuntime(ledgerCtx, () => scope.get());
+			ledgerRuntime = runtime;
+			runtime.open();
+			return () => {
+				if (ledgerRuntime === runtime) ledgerRuntime = void 0;
+				return runtime.dispose();
+			};
+		}, "dsh-cost-meter: cost ledger");
+	});
 	ctx.effect(() => ctx.webServer.register({
 		kind: "prefix",
 		path: "/dsh-cost-meter",
@@ -940,6 +1449,10 @@ function apply(ctx, config) {
 					try {
 						const body = await readJsonBody(req, MAX_BODY_BYTES);
 						if (!isPlainObject(body)) throw new Error("a JSON object body is required");
+						const current = scope.get();
+						const requestedCurrency = body.currency;
+						const nextCurrency = requestedCurrency === "CNY" || requestedCurrency === "USD" ? requestedCurrency : DEFAULT_COST_CONFIG.currency;
+						if (current !== void 0 && nextCurrency !== current.currency && ledgerRuntime !== void 0 && await ledgerRuntime.hasForeignEntries(nextCurrency)) throw new Error(`cannot change currency: existing cost entries were billed in ${current.currency}`);
 						await scope.replace(body);
 						sendJson(res, 200, {
 							ok: true,
@@ -961,6 +1474,49 @@ function apply(ctx, config) {
 						sendJson(res, 200, {
 							ok: true,
 							value: scope.get()
+						});
+					} catch (error) {
+						sendJson(res, 400, {
+							ok: false,
+							error: error instanceof Error ? error.message : String(error)
+						});
+					}
+				})();
+				return;
+			}
+			const ledgerMatch = /^\/dsh-cost-meter\/sessions\/([^/]+)\/ledger\/?$/.exec(url);
+			if (req.method === "GET" && ledgerMatch !== null) {
+				(async () => {
+					try {
+						let sessionId;
+						try {
+							sessionId = decodeURIComponent(ledgerMatch[1]);
+						} catch {
+							throw new Error("invalid session id encoding");
+						}
+						if (sessionId === "" || sessionId.includes("/") || sessionId.includes("\\")) throw new Error("invalid session id");
+						if (ledgerRuntime === void 0) {
+							sendJson(res, 503, {
+								ok: false,
+								error: "cost ledger is unavailable in this assembly"
+							});
+							return;
+						}
+						const result = await ledgerRuntime.read(sessionId);
+						if (result.kind === "unavailable") sendJson(res, 503, {
+							ok: false,
+							error: "cost ledger is unavailable"
+						});
+						else if (result.kind === "archived") sendJson(res, 200, {
+							ok: true,
+							sessionId,
+							archived: true,
+							value: null
+						});
+						else sendJson(res, 200, {
+							ok: true,
+							sessionId,
+							value: result.snapshot
 						});
 					} catch (error) {
 						sendJson(res, 400, {

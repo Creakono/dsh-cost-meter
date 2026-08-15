@@ -21,3 +21,13 @@
 .value {
   font-variant-numeric: tabular-nums;
 }
+
+.peak {
+  flex: none;
+  padding: 0 6px;
+  border: 1px solid var(--dsw-alias-state-warning-border, var(--dsw-alias-border-l2));
+  border-radius: 6px;
+  color: var(--dsw-alias-state-warning-primary, var(--dsw-alias-label-tertiary));
+  font-size: 11px;
+  line-height: 16px;
+}

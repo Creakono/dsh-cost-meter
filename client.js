@@ -8,8 +8,8 @@ window.__ModuleLoader__.load({
 		let _deepseek_ai_dsh_client_runtime_client = require("@deepseek-ai/dsh-client-runtime/client");
 		let _deepseek_ai_dsh_client_ui_primitives = require("@deepseek-ai/dsh-client-ui-primitives");
 		let react_jsx_runtime = require("react/jsx-runtime");
-		//#region src/client/pricing.ts
-		/** Currency display symbols. */
+		//#region src/pricing.ts
+		/** Currency display symbols used by the browser half. */
 		const CURRENCY_SYMBOLS = {
 			CNY: "¥",
 			USD: "$"
@@ -18,44 +18,58 @@ window.__ModuleLoader__.load({
 		function billedInputTokens(usage) {
 			return usage.uncachedInputTokens + usage.cacheReadTokens + usage.cacheWriteTokens;
 		}
-		/**
-		* Resolve the price tier for one model id: its table entry when present,
-		* the `default` fallback otherwise.
-		* @param config - the local price table.
-		* @param model - provider-owned model id, or null/undefined when unknown.
-		* @returns the applicable price tier.
-		*/
-		function resolveTier(config, model) {
-			if (model !== null && model !== void 0) {
-				const tier = config.models[model];
-				if (tier !== void 0) return tier;
-			}
-			return config.default;
+		/** Minutes since local midnight. */
+		function minutesOfTime(time) {
+			const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(time);
+			if (match === null) return NaN;
+			return Number(match[1]) * 60 + Number(match[2]);
+		}
+		/** True when `time` (epoch ms, local time) is inside the `[start, end)` window. */
+		function isInWindow(time, start, end) {
+			const startMinutes = minutesOfTime(start);
+			const endMinutes = minutesOfTime(end);
+			if (!Number.isFinite(startMinutes) || !Number.isFinite(endMinutes) || startMinutes === endMinutes) return false;
+			const date = new Date(time);
+			const minutes = date.getHours() * 60 + date.getMinutes();
+			if (startMinutes < endMinutes) return minutes >= startMinutes && minutes < endMinutes;
+			return minutes >= startMinutes || minutes < endMinutes;
 		}
 		/**
-		* Estimate the session cost from the durable provider usage and one price
-		* tier. Cache reads bill at the cache-hit price; uncached input and cache
-		* writes bill at the cache-miss price.
-		* @param usage - the session's `tokenUsage` projection value.
-		* @param tier - the price tier (per 1M tokens).
-		* @returns the per-bucket and total cost.
+		* The active peak window for one tier at `time` (epoch ms, local time).
+		* @param tier - the tier whose windows are checked.
+		* @param time - billing instant.
+		* @returns the first matching window, or null.
 		*/
-		function estimateCost(usage, tier) {
-			const cacheHitTokens = usage.cacheReadTokens;
-			const cacheMissTokens = usage.uncachedInputTokens + usage.cacheWriteTokens;
-			const outputTokens = usage.outputTokens;
-			const cacheHitCost = cacheHitTokens * tier.cacheHitPrice / 1e6;
-			const cacheMissCost = cacheMissTokens * tier.cacheMissPrice / 1e6;
-			const outputCost = outputTokens * tier.outputPrice / 1e6;
-			return {
-				cacheHitTokens,
-				cacheMissTokens,
-				outputTokens,
-				cacheHitCost,
-				cacheMissCost,
-				outputCost,
-				totalCost: cacheHitCost + cacheMissCost + outputCost
+		function activePeakWindow(tier, time) {
+			for (const window of tier.peakWindows) if (isInWindow(time, window.start, window.end)) return window;
+			return null;
+		}
+		/**
+		* Resolve the price tier for one model at one billing instant: its table
+		* entry when present (with peak windows applied), the `default` fallback
+		* otherwise.
+		* @param config - the local price table.
+		* @param model - provider-owned model id, or null/undefined when unknown.
+		* @param time - billing instant (epoch ms, local time).
+		* @returns the applicable tier and the matched peak window, if any.
+		*/
+		function resolveTierAt(config, model, time) {
+			const base = model !== null && model !== void 0 && config.models[model] !== void 0 ? config.models[model] : config.default;
+			const peakWindow = activePeakWindow(base, time);
+			return peakWindow === null ? {
+				tier: base,
+				peakWindow: null
+			} : {
+				tier: peakWindow,
+				peakWindow
 			};
+		}
+		/**
+		* The active peak window for one model right now, or null. Used by the dock
+		* to warn while the current session's model is billing at peak prices.
+		*/
+		function currentPeakWindow(config, model, now) {
+			return resolveTierAt(config, model, now).peakWindow;
 		}
 		/**
 		* Compact token count: 517 / 12.2K / 517K / 1.2M (one decimal under three
@@ -81,7 +95,7 @@ window.__ModuleLoader__.load({
 		}
 		//#endregion
 		//#region \0dsh-css:./src/client/CostDock.module.css.mjs
-		const css$1 = ".qcz85a_root{box-sizing:border-box;width:100%;max-width:var(--dsh-chat-content-width);padding:2px calc(var(--dsh-composer-side-clearance) + 16px) 0;color:var(--dsw-alias-label-tertiary);white-space:nowrap;justify-content:center;align-items:baseline;gap:6px;margin:0 auto;font-size:12px;line-height:20px;display:flex;overflow:hidden}.qcz85a_value{font-variant-numeric:tabular-nums}";
+		const css$1 = ".qcz85a_root{box-sizing:border-box;width:100%;max-width:var(--dsh-chat-content-width);padding:2px calc(var(--dsh-composer-side-clearance) + 16px) 0;color:var(--dsw-alias-label-tertiary);white-space:nowrap;justify-content:center;align-items:baseline;gap:6px;margin:0 auto;font-size:12px;line-height:20px;display:flex;overflow:hidden}.qcz85a_value{font-variant-numeric:tabular-nums}.qcz85a_peak{border:1px solid var(--dsw-alias-state-warning-border,var(--dsw-alias-border-l2));color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-label-tertiary));border-radius:6px;flex:none;padding:0 6px;font-size:11px;line-height:16px}";
 		const tagId$1 = "dsh-cost-meter/CostDock.module.css";
 		if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId$1) + "]") === null) {
 			const tag = document.createElement("style");
@@ -91,6 +105,7 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 		var CostDock_module_css_default = {
+			"peak": "qcz85a_peak",
 			"root": "qcz85a_root",
 			"value": "qcz85a_value"
 		};
@@ -98,52 +113,117 @@ window.__ModuleLoader__.load({
 		//#region src/client/CostDock.tsx
 		/**
 		* Cost readout appended to the chat stats line: one entry in
-		* `conversation.composer.dock` right after the shipped stats entry (order 0),
-		* fed by the durable `tokenUsage` projection, the session's current model, and
-		* the per-model price table.
+		* `conversation.composer.dock` right after the shipped stats entry (order 0).
+		*
+		* The figure is the sum of the session's durable per-step ledger entries
+		* (immutable price snapshots), not a live re-estimate. It also warns while
+		* the current model is inside one of its configured peak windows.
 		*/
 		/**
-		* Render the estimated cost after the stats line. Renders nothing until the
-		* provider has reported usage (the stats line gates its token groups the same
-		* way) and the price table has loaded; the hover tooltip carries the priced
-		* model and the per-bucket breakdown.
+		* Read the session's durable cost ledger, refetching whenever the usage
+		* projection advances (a step just billed) and every 30 seconds (archive
+		* reconciliation and peak-time refreshes).
+		*/
+		function useSessionLedger(sessionId, usage) {
+			const [state, setState] = (0, react.useState)({
+				snapshot: null,
+				failed: false
+			});
+			(0, react.useEffect)(() => {
+				let cancelled = false;
+				const load = () => {
+					fetch(`/dsh-cost-meter/sessions/${encodeURIComponent(sessionId)}/ledger`).then((response) => {
+						if (!response.ok) throw new Error(String(response.status));
+						return response.json();
+					}).then((body) => {
+						if (cancelled) return;
+						const payload = body;
+						setState({
+							snapshot: payload.ok === true && payload.archived !== true ? payload.value ?? null : null,
+							failed: payload.ok !== true
+						});
+					}).catch(() => {
+						if (!cancelled) setState((current) => ({
+							...current,
+							failed: true
+						}));
+					});
+				};
+				load();
+				const timer = setInterval(load, 3e4);
+				return () => {
+					cancelled = true;
+					clearInterval(timer);
+				};
+			}, [sessionId, usage]);
+			return state;
+		}
+		/** Local `HH:mm` window label. */
+		function formatWindow(start, end) {
+			return `${start}\u2013${end}`;
+		}
+		/**
+		* Render the ledger total after the stats line. Renders nothing until the
+		* provider has reported usage, the price table and ledger have loaded, and at
+		* least one step has a durable entry. The hover tooltip carries the priced
+		* model, the active peak window, the billed step count, and the per-bucket
+		* breakdown.
 		* @param props - composed slot props.
 		* @returns the cost line element tree, or null while there is nothing to show.
 		*/
-		function CostDock({ useProjection, useConfig, useModel, t }) {
+		function CostDock({ sessionId, useProjection, useConfig, useModel, t }) {
 			const usage = useProjection("tokenUsage");
 			const config = useConfig();
 			const model = useModel();
+			const ledger = useSessionLedger(sessionId, usage);
+			const [now, setNow] = (0, react.useState)(() => Date.now());
+			(0, react.useEffect)(() => {
+				const timer = setInterval(() => setNow(Date.now()), 3e4);
+				return () => {
+					clearInterval(timer);
+				};
+			}, []);
 			if (usage === void 0) return null;
 			if (config === null) return null;
 			if (billedInputTokens(usage) === 0 && usage.outputTokens === 0) return null;
-			const breakdown = estimateCost(usage, resolveTier(config, model));
+			const snapshot = ledger.snapshot;
+			if (snapshot === null || snapshot.entries.length === 0) return null;
+			const peak = currentPeakWindow(config, model, now);
 			const symbol = CURRENCY_SYMBOLS[config.currency];
 			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Tooltip, {
 				label: [
 					model !== null ? `${t("dock.model")} ${model}` : t("dock.fallback"),
-					`${t("dock.cacheHit")} ${formatTokens(breakdown.cacheHitTokens)} \u00b7 ${symbol}${formatCost(breakdown.cacheHitCost)}`,
-					`${t("dock.cacheMiss")} ${formatTokens(breakdown.cacheMissTokens)} \u00b7 ${symbol}${formatCost(breakdown.cacheMissCost)}`,
-					`${t("dock.output")} ${formatTokens(breakdown.outputTokens)} \u00b7 ${symbol}${formatCost(breakdown.outputCost)}`
+					`${t("dock.entries")} ${snapshot.entries.length}`,
+					...peak !== null ? [`${t("dock.peakWindow")} ${formatWindow(peak.start, peak.end)} \u00b7 ${t("dock.peakActive")}`] : [],
+					`${t("dock.cacheHit")} ${formatTokens(snapshot.tokens.cacheHitTokens)} \u00b7 ${symbol}${formatCost(snapshot.costs.cacheHitCost)}`,
+					`${t("dock.cacheMiss")} ${formatTokens(snapshot.tokens.cacheMissTokens)} \u00b7 ${symbol}${formatCost(snapshot.costs.cacheMissCost)}`,
+					`${t("dock.output")} ${formatTokens(snapshot.tokens.outputTokens)} \u00b7 ${symbol}${formatCost(snapshot.costs.outputCost)}`
 				].join(" · "),
 				side: "top",
 				delayMs: 500,
 				children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 					className: CostDock_module_css_default.root,
-					children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("dock.estimate") }), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
-						className: CostDock_module_css_default.value,
-						children: [
-							"~",
-							symbol,
-							formatCost(breakdown.totalCost)
-						]
-					})]
+					children: [
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("dock.estimate") }),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+							className: CostDock_module_css_default.value,
+							children: [
+								"~",
+								symbol,
+								formatCost(snapshot.costs.totalCost)
+							]
+						}),
+						peak !== null && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: CostDock_module_css_default.peak,
+							children: t("dock.peak")
+						})
+					]
 				})
 			});
 		}
 		//#endregion
 		//#region \0dsh-css:./src/client/CostSettingsSection.module.css.mjs
-		const css = ".ilN6fW_group{border-bottom:1px solid var(--dsw-alias-border-l2);flex-direction:column;gap:8px;padding:16px 0;display:flex}.ilN6fW_title{color:var(--dsw-alias-label-primary);font-size:14px;font-weight:400;line-height:22px}.ilN6fW_hint{color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}.ilN6fW_currencyRow{align-items:center;gap:8px;margin-top:4px;font-size:13px;line-height:20px;display:flex}.ilN6fW_fieldLabel{color:var(--dsw-alias-label-secondary);flex:0 0 110px}.ilN6fW_select{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);min-width:140px;height:30px;font:inherit;color:var(--dsw-alias-label-primary);background:0 0;border-radius:8px;padding:0 8px;font-size:13px;line-height:20px}.ilN6fW_block{flex-direction:column;gap:6px;margin-top:8px;display:flex}.ilN6fW_blockTitle{color:var(--dsw-alias-label-primary);font-size:13px;font-weight:500;line-height:20px}.ilN6fW_blockHint{color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}.ilN6fW_tierRow{flex-wrap:wrap;align-items:center;gap:12px;display:flex}.ilN6fW_modelRow{flex-wrap:wrap;align-items:center;gap:12px;padding:4px 0;display:flex}.ilN6fW_nameInput{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);width:200px;height:30px;font:inherit;color:var(--dsw-alias-label-primary);background:0 0;border-radius:8px;padding:0 8px;font-size:13px;line-height:20px}.ilN6fW_priceCell{align-items:center;gap:6px;display:flex}.ilN6fW_priceLabel{color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}.ilN6fW_input{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);width:90px;height:30px;font:inherit;color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums;background:0 0;border-radius:8px;padding:0 8px;font-size:13px;line-height:20px}.ilN6fW_unit{color:var(--dsw-alias-label-caption);flex:none;font-size:13px;line-height:20px}.ilN6fW_addButton{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);font:inherit;color:var(--dsw-alias-label-primary);cursor:pointer;background:0 0;border-radius:8px;align-self:flex-start;padding:5px 14px;font-size:13px;line-height:20px}.ilN6fW_addButton:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}.ilN6fW_removeButton{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);font:inherit;color:var(--dsw-alias-label-secondary);cursor:pointer;background:0 0;border-radius:8px;padding:3px 10px;font-size:12px;line-height:18px}.ilN6fW_removeButton:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-state-error-primary)}.ilN6fW_actions{flex-wrap:wrap;align-items:center;gap:12px;margin-top:8px;display:flex}.ilN6fW_button{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);font:inherit;color:var(--dsw-alias-label-primary);cursor:pointer;background:0 0;border-radius:8px;padding:5px 14px;font-size:13px;line-height:20px}.ilN6fW_button:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}.ilN6fW_button:disabled,.ilN6fW_select:disabled,.ilN6fW_input:disabled,.ilN6fW_nameInput:disabled,.ilN6fW_addButton:disabled,.ilN6fW_removeButton:disabled{opacity:.6;cursor:default}.ilN6fW_select:focus-visible,.ilN6fW_input:focus-visible,.ilN6fW_nameInput:focus-visible,.ilN6fW_button:focus-visible,.ilN6fW_addButton:focus-visible,.ilN6fW_removeButton:focus-visible{outline:2px solid var(--dsw-alias-label-tertiary);outline-offset:-2px}.ilN6fW_statusOk{color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}.ilN6fW_statusError{color:var(--dsw-alias-color-danger,var(--dsw-alias-label-primary));font-size:13px;line-height:20px}";
+		const css = ".ilN6fW_group{border-bottom:1px solid var(--dsw-alias-border-l2);flex-direction:column;gap:8px;padding:16px 0;display:flex}.ilN6fW_title{color:var(--dsw-alias-label-primary);font-size:14px;font-weight:400;line-height:22px}.ilN6fW_hint{color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}.ilN6fW_currencyRow{align-items:center;gap:8px;margin-top:4px;font-size:13px;line-height:20px;display:flex}.ilN6fW_fieldLabel{color:var(--dsw-alias-label-secondary);flex:0 0 110px}.ilN6fW_select{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);min-width:140px;height:30px;font:inherit;color:var(--dsw-alias-label-primary);background:0 0;border-radius:8px;padding:0 8px;font-size:13px;line-height:20px}.ilN6fW_block{flex-direction:column;gap:6px;margin-top:8px;display:flex}.ilN6fW_blockTitle{color:var(--dsw-alias-label-primary);font-size:13px;font-weight:500;line-height:20px}.ilN6fW_blockHint{color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}.ilN6fW_tierRow{flex-wrap:wrap;align-items:center;gap:12px;display:flex}.ilN6fW_modelRow{flex-wrap:wrap;align-items:center;gap:12px;padding:4px 0;display:flex}.ilN6fW_nameInput{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);width:200px;height:30px;font:inherit;color:var(--dsw-alias-label-primary);background:0 0;border-radius:8px;padding:0 8px;font-size:13px;line-height:20px}.ilN6fW_priceCell{align-items:center;gap:6px;display:flex}.ilN6fW_priceLabel{color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}.ilN6fW_input{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);width:90px;height:30px;font:inherit;color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums;background:0 0;border-radius:8px;padding:0 8px;font-size:13px;line-height:20px}.ilN6fW_unit{color:var(--dsw-alias-label-caption);flex:none;font-size:13px;line-height:20px}.ilN6fW_addButton{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);font:inherit;color:var(--dsw-alias-label-primary);cursor:pointer;background:0 0;border-radius:8px;align-self:flex-start;padding:5px 14px;font-size:13px;line-height:20px}.ilN6fW_addButton:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}.ilN6fW_removeButton{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);font:inherit;color:var(--dsw-alias-label-secondary);cursor:pointer;background:0 0;border-radius:8px;padding:3px 10px;font-size:12px;line-height:18px}.ilN6fW_removeButton:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-state-error-primary)}.ilN6fW_actions{flex-wrap:wrap;align-items:center;gap:12px;margin-top:8px;display:flex}.ilN6fW_button{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);font:inherit;color:var(--dsw-alias-label-primary);cursor:pointer;background:0 0;border-radius:8px;padding:5px 14px;font-size:13px;line-height:20px}.ilN6fW_button:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}.ilN6fW_button:disabled,.ilN6fW_select:disabled,.ilN6fW_input:disabled,.ilN6fW_nameInput:disabled,.ilN6fW_timeInput:disabled,.ilN6fW_addButton:disabled,.ilN6fW_removeButton:disabled{opacity:.6;cursor:default}.ilN6fW_select:focus-visible,.ilN6fW_input:focus-visible,.ilN6fW_nameInput:focus-visible,.ilN6fW_timeInput:focus-visible,.ilN6fW_button:focus-visible,.ilN6fW_addButton:focus-visible,.ilN6fW_removeButton:focus-visible{outline:2px solid var(--dsw-alias-label-tertiary);outline-offset:-2px}.ilN6fW_statusOk{color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}.ilN6fW_statusError{color:var(--dsw-alias-color-danger,var(--dsw-alias-label-primary));font-size:13px;line-height:20px}.ilN6fW_modelBlock{flex-direction:column;gap:8px;padding:4px 0 10px;display:flex}.ilN6fW_modelBlock+.ilN6fW_modelBlock{border-top:1px dashed var(--dsw-alias-border-l2)}.ilN6fW_priceGroupLabel{color:var(--dsw-alias-label-caption);flex:none;font-size:13px;line-height:20px}.ilN6fW_toggleRow{color:var(--dsw-alias-label-secondary);align-items:center;gap:8px;font-size:13px;line-height:20px;display:flex}.ilN6fW_toggleRow input{accent-color:var(--dsw-alias-label-primary);margin:0}.ilN6fW_peakBlock{border-left:2px solid var(--dsw-alias-border-l2);flex-direction:column;gap:8px;padding:8px 0 0 12px;display:flex}.ilN6fW_peakWindowRow{flex-wrap:wrap;align-items:center;gap:12px;display:flex}.ilN6fW_timeCell{align-items:center;gap:6px;display:flex}.ilN6fW_timeInput{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);width:110px;height:30px;font:inherit;color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums;background:0 0;border-radius:8px;padding:0 8px;font-size:13px;line-height:20px}";
 		const tagId = "dsh-cost-meter/CostSettingsSection.module.css";
 		if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId) + "]") === null) {
 			const tag = document.createElement("style");
@@ -153,36 +233,44 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 		var CostSettingsSection_module_css_default = {
-			"unit": "ilN6fW_unit",
-			"addButton": "ilN6fW_addButton",
-			"blockTitle": "ilN6fW_blockTitle",
-			"input": "ilN6fW_input",
-			"button": "ilN6fW_button",
-			"hint": "ilN6fW_hint",
-			"statusOk": "ilN6fW_statusOk",
-			"tierRow": "ilN6fW_tierRow",
-			"priceLabel": "ilN6fW_priceLabel",
-			"statusError": "ilN6fW_statusError",
-			"nameInput": "ilN6fW_nameInput",
-			"modelRow": "ilN6fW_modelRow",
-			"currencyRow": "ilN6fW_currencyRow",
-			"block": "ilN6fW_block",
-			"group": "ilN6fW_group",
-			"select": "ilN6fW_select",
-			"removeButton": "ilN6fW_removeButton",
 			"actions": "ilN6fW_actions",
-			"priceCell": "ilN6fW_priceCell",
+			"timeInput": "ilN6fW_timeInput",
+			"blockHint": "ilN6fW_blockHint",
+			"unit": "ilN6fW_unit",
+			"removeButton": "ilN6fW_removeButton",
+			"blockTitle": "ilN6fW_blockTitle",
+			"peakBlock": "ilN6fW_peakBlock",
+			"group": "ilN6fW_group",
+			"block": "ilN6fW_block",
 			"title": "ilN6fW_title",
+			"hint": "ilN6fW_hint",
+			"toggleRow": "ilN6fW_toggleRow",
+			"modelRow": "ilN6fW_modelRow",
+			"tierRow": "ilN6fW_tierRow",
 			"fieldLabel": "ilN6fW_fieldLabel",
-			"blockHint": "ilN6fW_blockHint"
+			"priceCell": "ilN6fW_priceCell",
+			"currencyRow": "ilN6fW_currencyRow",
+			"button": "ilN6fW_button",
+			"input": "ilN6fW_input",
+			"priceGroupLabel": "ilN6fW_priceGroupLabel",
+			"modelBlock": "ilN6fW_modelBlock",
+			"addButton": "ilN6fW_addButton",
+			"peakWindowRow": "ilN6fW_peakWindowRow",
+			"timeCell": "ilN6fW_timeCell",
+			"statusError": "ilN6fW_statusError",
+			"priceLabel": "ilN6fW_priceLabel",
+			"select": "ilN6fW_select",
+			"nameInput": "ilN6fW_nameInput",
+			"statusOk": "ilN6fW_statusOk"
 		};
 		//#endregion
 		//#region src/client/CostSettingsSection.tsx
 		/**
 		* Settings page editing the per-model price table: currency, a `default`
-		* fallback tier, and a list of per-model tiers. Renders as one Settings
-		* section (`settings.section`); reads/writes through this plugin's host
-		* routes via the injected save/reset face.
+		* fallback tier, and a list of per-model tiers. Each model tier can enable
+		* any number of daily peak-time windows; every window carries its own three
+		* prices. Renders as one Settings section (`settings.section`); reads/writes
+		* through this plugin's host routes via the injected save/reset face.
 		*/
 		/** Price fields rendered as number inputs, in display order. */
 		const PRICE_FIELDS = [
@@ -200,6 +288,15 @@ window.__ModuleLoader__.load({
 			}
 		];
 		let nextUid = 1;
+		/** Strip the branch metadata and copy the three base prices. */
+		function basePrices(tier) {
+			return {
+				cacheHitPrice: tier.cacheHitPrice,
+				cacheMissPrice: tier.cacheMissPrice,
+				outputPrice: tier.outputPrice,
+				peakWindows: []
+			};
+		}
 		/** Convert the persisted record to the editable array draft. */
 		function toDraft(config) {
 			return {
@@ -208,7 +305,12 @@ window.__ModuleLoader__.load({
 				models: Object.entries(config.models).map(([name, tier]) => ({
 					uid: nextUid++,
 					name,
-					tier: { ...tier }
+					tier: basePrices(tier),
+					peakEnabled: tier.peakWindows.length > 0,
+					peakWindows: tier.peakWindows.map((window) => ({
+						...window,
+						uid: nextUid++
+					}))
 				}))
 			};
 		}
@@ -217,7 +319,11 @@ window.__ModuleLoader__.load({
 			const models = {};
 			for (const model of draft.models) {
 				const name = model.name.trim();
-				if (name !== "") models[name] = model.tier;
+				if (name === "") continue;
+				models[name] = {
+					...model.tier,
+					...model.peakEnabled && model.peakWindows.length > 0 ? { peakWindows: model.peakWindows.map(({ uid: _uid, ...window }) => window) } : {}
+				};
 			}
 			return {
 				currency: draft.currency,
@@ -255,37 +361,166 @@ window.__ModuleLoader__.load({
 				}
 			});
 		}
-		/** One editable per-model tier row. */
-		function ModelRow(props) {
-			const { model, disabled, t, onChangeName, onChangePrice, onRemove } = props;
+		/** One local `HH:mm` time input. */
+		function TimeField(props) {
+			const { value, disabled, onChange } = props;
+			const [text, setText] = (0, react.useState)(value);
+			const [focused, setFocused] = (0, react.useState)(false);
+			(0, react.useEffect)(() => {
+				if (!focused) setText(value);
+			}, [value, focused]);
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+				className: CostSettingsSection_module_css_default.timeInput,
+				type: "time",
+				disabled,
+				value: text,
+				onFocus: () => setFocused(true),
+				onBlur: () => {
+					setFocused(false);
+					if (/^([01]\d|2[0-3]):[0-5]\d$/.test(text) && text !== value) onChange(text);
+					else setText(value);
+				},
+				onChange: (e) => {
+					setText(e.target.value);
+				}
+			});
+		}
+		/** The three price cells shared by base and peak tiers. */
+		function PriceCells(props) {
+			const { tier, disabled, t, onChange } = props;
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)(react_jsx_runtime.Fragment, { children: PRICE_FIELDS.map(({ field, labelKey }) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+				className: CostSettingsSection_module_css_default.priceCell,
+				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+					className: CostSettingsSection_module_css_default.priceLabel,
+					children: t(labelKey)
+				}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)(NumberField, {
+					value: tier[field],
+					disabled,
+					onChange: (v) => onChange(field, v)
+				})]
+			}, field)) });
+		}
+		/** One editable peak window row. */
+		function PeakWindowRow(props) {
+			const { window, disabled, t, onChange, onRemove } = props;
 			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-				className: CostSettingsSection_module_css_default.modelRow,
+				className: CostSettingsSection_module_css_default.peakWindowRow,
 				children: [
-					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
-						className: CostSettingsSection_module_css_default.nameInput,
-						type: "text",
-						value: model.name,
-						placeholder: t("models.namePlaceholder"),
-						disabled,
-						onChange: (e) => onChangeName(e.target.value)
-					}),
-					PRICE_FIELDS.map(({ field, labelKey }) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
-						className: CostSettingsSection_module_css_default.priceCell,
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+						className: CostSettingsSection_module_css_default.timeCell,
 						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 							className: CostSettingsSection_module_css_default.priceLabel,
-							children: t(labelKey)
-						}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)(NumberField, {
-							value: model.tier[field],
+							children: t("models.peakStart")
+						}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)(TimeField, {
+							value: window.start,
 							disabled,
-							onChange: (v) => onChangePrice(field, v)
+							onChange: (v) => onChange(window.uid, (w) => {
+								w.start = v;
+							})
 						})]
-					}, field)),
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+						className: CostSettingsSection_module_css_default.timeCell,
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: CostSettingsSection_module_css_default.priceLabel,
+							children: t("models.peakEnd")
+						}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)(TimeField, {
+							value: window.end,
+							disabled,
+							onChange: (v) => onChange(window.uid, (w) => {
+								w.end = v;
+							})
+						})]
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						className: CostSettingsSection_module_css_default.priceGroupLabel,
+						children: t("models.peakPrices")
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)(PriceCells, {
+						tier: window,
+						disabled,
+						t,
+						onChange: (field, value) => onChange(window.uid, (w) => {
+							w[field] = value;
+						})
+					}),
 					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
 						type: "button",
 						className: CostSettingsSection_module_css_default.removeButton,
 						disabled,
-						onClick: onRemove,
-						children: t("models.remove")
+						onClick: () => onRemove(window.uid),
+						children: t("models.peakRemove")
+					})
+				]
+			});
+		}
+		/** One editable per-model tier row plus its peak branch. */
+		function ModelRow(props) {
+			const { model, disabled, t, onChangeName, onChangePrice, onTogglePeak, onChangeWindow, onAddWindow, onRemoveWindow, onRemove } = props;
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: CostSettingsSection_module_css_default.modelBlock,
+				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						className: CostSettingsSection_module_css_default.modelRow,
+						children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+								className: CostSettingsSection_module_css_default.nameInput,
+								type: "text",
+								value: model.name,
+								placeholder: t("models.namePlaceholder"),
+								disabled,
+								onChange: (e) => onChangeName(e.target.value)
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: CostSettingsSection_module_css_default.priceGroupLabel,
+								children: t("models.basePrices")
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)(PriceCells, {
+								tier: model.tier,
+								disabled,
+								t,
+								onChange: onChangePrice
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+								type: "button",
+								className: CostSettingsSection_module_css_default.removeButton,
+								disabled,
+								onClick: onRemove,
+								children: t("models.remove")
+							})
+						]
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+						className: CostSettingsSection_module_css_default.toggleRow,
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+							type: "checkbox",
+							checked: model.peakEnabled,
+							disabled,
+							onChange: (e) => onTogglePeak(e.target.checked)
+						}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("models.peakToggle") })]
+					}),
+					model.peakEnabled && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						className: CostSettingsSection_module_css_default.peakBlock,
+						children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+								className: CostSettingsSection_module_css_default.blockHint,
+								children: t("models.peakHint")
+							}),
+							model.peakWindows.map((window) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)(PeakWindowRow, {
+								window,
+								disabled,
+								t,
+								onChange: onChangeWindow,
+								onRemove: onRemoveWindow
+							}, window.uid)),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+								type: "button",
+								className: CostSettingsSection_module_css_default.addButton,
+								disabled,
+								onClick: onAddWindow,
+								children: t("models.peakAdd")
+							})
+						]
 					})
 				]
 			});
@@ -311,7 +546,8 @@ window.__ModuleLoader__.load({
 						default: { ...d.default },
 						models: d.models.map((m) => ({
 							...m,
-							tier: { ...m.tier }
+							tier: { ...m.tier },
+							peakWindows: m.peakWindows.map((w) => ({ ...w }))
 						}))
 					};
 					mutate(next);
@@ -398,19 +634,14 @@ window.__ModuleLoader__.load({
 							}),
 							/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 								className: CostSettingsSection_module_css_default.tierRow,
-								children: [PRICE_FIELDS.map(({ field, labelKey }) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
-									className: CostSettingsSection_module_css_default.priceCell,
-									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-										className: CostSettingsSection_module_css_default.priceLabel,
-										children: t(labelKey)
-									}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)(NumberField, {
-										value: draft.default[field],
-										disabled,
-										onChange: (v) => setDraftField((d) => {
-											d.default[field] = v;
-										})
-									})]
-								}, field)), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(PriceCells, {
+									tier: draft.default,
+									disabled,
+									t,
+									onChange: (field, value) => setDraftField((d) => {
+										d.default[field] = value;
+									})
+								}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 									className: CostSettingsSection_module_css_default.unit,
 									children: t("prices.unit")
 								})]
@@ -440,6 +671,33 @@ window.__ModuleLoader__.load({
 									const row = d.models.find((m) => m.uid === model.uid);
 									if (row !== void 0) row.tier[field] = value;
 								}),
+								onTogglePeak: (enabled) => setDraftField((d) => {
+									const row = d.models.find((m) => m.uid === model.uid);
+									if (row !== void 0) row.peakEnabled = enabled;
+								}),
+								onChangeWindow: (uid, mutate) => setDraftField((d) => {
+									const window = d.models.find((m) => m.uid === model.uid)?.peakWindows.find((w) => w.uid === uid);
+									if (window !== void 0) mutate(window);
+								}),
+								onAddWindow: () => setDraftField((d) => {
+									const row = d.models.find((m) => m.uid === model.uid);
+									if (row === void 0) return;
+									row.peakEnabled = true;
+									const uid = nextUid++;
+									row.peakWindows.push({
+										uid,
+										id: `peak-${uid}`,
+										start: "09:00",
+										end: "21:00",
+										cacheHitPrice: row.tier.cacheHitPrice,
+										cacheMissPrice: row.tier.cacheMissPrice,
+										outputPrice: row.tier.outputPrice
+									});
+								}),
+								onRemoveWindow: (uid) => setDraftField((d) => {
+									const row = d.models.find((m) => m.uid === model.uid);
+									if (row !== void 0) row.peakWindows = row.peakWindows.filter((w) => w.uid !== uid);
+								}),
 								onRemove: () => setDraftField((d) => {
 									d.models = d.models.filter((m) => m.uid !== model.uid);
 								})
@@ -452,7 +710,9 @@ window.__ModuleLoader__.load({
 									d.models.push({
 										uid: nextUid++,
 										name: "",
-										tier: { ...d.default }
+										tier: basePrices(d.default),
+										peakEnabled: false,
+										peakWindows: []
 									});
 								}),
 								children: t("models.add")
@@ -515,6 +775,15 @@ window.__ModuleLoader__.load({
 			"models.add": "添加模型",
 			"models.namePlaceholder": "模型名称（如 deepseek-v4-flash）",
 			"models.remove": "删除",
+			"models.basePrices": "平时价格",
+			"models.peakToggle": "启用峰谷定价",
+			"models.peakHint": "每个时段均为本地时间，跨午夜请写为 22:00–06:00；多个时段重叠时按列表顺序取第一个。",
+			"models.peakAdd": "添加峰值时段",
+			"models.peakWindow": "峰值时段",
+			"models.peakStart": "开始",
+			"models.peakEnd": "结束",
+			"models.peakPrices": "峰值价格",
+			"models.peakRemove": "删除时段",
 			"prices.cacheHit": "输入缓存命中",
 			"prices.cacheMiss": "输入缓存未命中",
 			"prices.output": "输出",
@@ -530,7 +799,11 @@ window.__ModuleLoader__.load({
 			"dock.fallback": "默认价格（未匹配模型）",
 			"dock.cacheHit": "输入缓存命中",
 			"dock.cacheMiss": "输入缓存未命中",
-			"dock.output": "输出"
+			"dock.output": "输出",
+			"dock.peak": "峰值",
+			"dock.peakWindow": "峰值时段",
+			"dock.peakActive": "当前处于峰值时段",
+			"dock.entries": "已计费条目"
 		};
 		/** English dictionary, checked complete against the zh key set. */
 		const en = {
@@ -549,6 +822,15 @@ window.__ModuleLoader__.load({
 			"models.add": "Add model",
 			"models.namePlaceholder": "Model name (e.g. deepseek-v4-flash)",
 			"models.remove": "Remove",
+			"models.basePrices": "Off-peak prices",
+			"models.peakToggle": "Enable peak pricing",
+			"models.peakHint": "Windows use local time; enter 22:00–06:00 for an overnight window. When windows overlap, the first match wins.",
+			"models.peakAdd": "Add peak window",
+			"models.peakWindow": "Peak window",
+			"models.peakStart": "Start",
+			"models.peakEnd": "End",
+			"models.peakPrices": "Peak prices",
+			"models.peakRemove": "Remove window",
 			"prices.cacheHit": "Input cache hit",
 			"prices.cacheMiss": "Input cache miss",
 			"prices.output": "Output",
@@ -564,7 +846,11 @@ window.__ModuleLoader__.load({
 			"dock.fallback": "Default price (no model matched)",
 			"dock.cacheHit": "Input cache hit",
 			"dock.cacheMiss": "Input cache miss",
-			"dock.output": "Output"
+			"dock.output": "Output",
+			"dock.peak": "Peak",
+			"dock.peakWindow": "Peak window",
+			"dock.peakActive": "Currently in a peak window",
+			"dock.entries": "Billed entries"
 		};
 		//#endregion
 		//#region src/client/index.ts
@@ -572,12 +858,11 @@ window.__ModuleLoader__.load({
 		* dsh-cost-meter browser half:
 		*
 		* - `CostDock` — one entry in `conversation.composer.dock` (order 1, right
-		*   after the shipped stats line at order 0) that appends the session's
-		*   estimated cost, computed from the `tokenUsage` projection and the price
-		*   tier for the session's current model (per-model, with a `default`
-		*   fallback);
+		*   after the shipped stats line at order 0) that displays the sum of the
+		*   session's durable per-step cost ledger and a live peak-time warning;
 		* - `CostSettingsSection` — one Settings page (`settings.section`) editing the
-		*   currency, the fallback tier, and the per-model price tiers.
+		*   currency, the fallback tier, and per-model prices with optional
+		*   multi-window peak pricing.
 		*
 		* The price table is read/written over this plugin's own same-origin routes
 		* (`/dsh-cost-meter/*`), because the api-proxy settings allowlist does not
@@ -643,6 +928,7 @@ window.__ModuleLoader__.load({
 						directoryStore = directories.directoryFor(sessionId)?.store;
 					} catch {}
 					return {
+						sessionId,
 						useConfig,
 						useModel: () => (0, react.useSyncExternalStore)(directoryStore !== void 0 ? directoryStore.subscribe : noopSubscribe, () => directoryStore?.getSnapshot()?.current?.model ?? null, () => null)
 					};

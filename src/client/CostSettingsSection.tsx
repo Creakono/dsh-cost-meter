@@ -1,12 +1,13 @@
 /**
  * Settings page editing the per-model price table: currency, a `default`
- * fallback tier, and a list of per-model tiers. Renders as one Settings
- * section (`settings.section`); reads/writes through this plugin's host
- * routes via the injected save/reset face.
+ * fallback tier, and a list of per-model tiers. Each model tier can enable
+ * any number of daily peak-time windows; every window carries its own three
+ * prices. Renders as one Settings section (`settings.section`); reads/writes
+ * through this plugin's host routes via the injected save/reset face.
  */
 import { useEffect, useState } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import type { CostConfig, PriceTier } from './pricing.ts'
+import type { CostConfig, PeakWindow, PriceTier, PriceValues } from './pricing.ts'
 import css from './CostSettingsSection.module.css'
 
 /** Component props: the section runtime share, the pricing face, and the locale seat. */
@@ -27,11 +28,18 @@ const PRICE_FIELDS = [
 ] as const
 type PriceField = typeof PRICE_FIELDS[number]['field']
 
+/** One editable peak window (uid keeps the React key stable). */
+interface PeakWindowDraft extends PeakWindow {
+  uid: number
+}
+
 /** One editable per-model row (uid keeps the React key stable across renames). */
 interface ModelDraft {
   uid: number
   name: string
   tier: PriceTier
+  peakEnabled: boolean
+  peakWindows: PeakWindowDraft[]
 }
 
 /** The editable draft: models as a stable array instead of a record. */
@@ -50,6 +58,16 @@ type SaveState =
 
 let nextUid = 1
 
+/** Strip the branch metadata and copy the three base prices. */
+function basePrices(tier: PriceTier): PriceTier {
+  return {
+    cacheHitPrice: tier.cacheHitPrice,
+    cacheMissPrice: tier.cacheMissPrice,
+    outputPrice: tier.outputPrice,
+    peakWindows: [],
+  }
+}
+
 /** Convert the persisted record to the editable array draft. */
 function toDraft(config: CostConfig): CostConfigDraft {
   return {
@@ -58,7 +76,9 @@ function toDraft(config: CostConfig): CostConfigDraft {
     models: Object.entries(config.models).map(([name, tier]) => ({
       uid: nextUid++,
       name,
-      tier: { ...tier },
+      tier: basePrices(tier),
+      peakEnabled: tier.peakWindows.length > 0,
+      peakWindows: tier.peakWindows.map(window => ({ ...window, uid: nextUid++ })),
     })),
   }
 }
@@ -68,7 +88,13 @@ function fromDraft(draft: CostConfigDraft): CostConfig {
   const models: Record<string, PriceTier> = {}
   for (const model of draft.models) {
     const name = model.name.trim()
-    if (name !== '') models[name] = model.tier
+    if (name === '') continue
+    models[name] = {
+      ...model.tier,
+      ...model.peakEnabled && model.peakWindows.length > 0
+        ? { peakWindows: model.peakWindows.map(({ uid: _uid, ...window }) => window) }
+        : {},
+    }
   }
   return {
     currency: draft.currency,
@@ -110,39 +136,155 @@ function NumberField(props: { value: number; disabled?: boolean; onChange: (v: n
   )
 }
 
-/** One editable per-model tier row. */
+/** One local `HH:mm` time input. */
+function TimeField(props: { value: string; disabled?: boolean; onChange: (v: string) => void }) {
+  const { value, disabled, onChange } = props
+  const [text, setText] = useState(value)
+  const [focused, setFocused] = useState(false)
+  useEffect(() => {
+    if (!focused) setText(value)
+  }, [value, focused])
+  return (
+    <input
+      className={css.timeInput}
+      type="time"
+      disabled={disabled}
+      value={text}
+      onFocus={() => setFocused(true)}
+      onBlur={() => {
+        setFocused(false)
+        if (/^([01]\d|2[0-3]):[0-5]\d$/.test(text) && text !== value) onChange(text)
+        else setText(value)
+      }}
+      onChange={(e) => { setText(e.target.value) }}
+    />
+  )
+}
+
+/** The three price cells shared by base and peak tiers. */
+function PriceCells(props: {
+  tier: PriceValues
+  disabled: boolean
+  t: CostSettingsSectionProps['t']
+  onChange: (field: PriceField, value: number) => void
+}) {
+  const { tier, disabled, t, onChange } = props
+  return (
+    <>
+      {PRICE_FIELDS.map(({ field, labelKey }) => (
+        <label className={css.priceCell} key={field}>
+          <span className={css.priceLabel}>{t(labelKey)}</span>
+          <NumberField value={tier[field]} disabled={disabled} onChange={(v) => onChange(field, v)} />
+        </label>
+      ))}
+    </>
+  )
+}
+
+/** One editable peak window row. */
+function PeakWindowRow(props: {
+  window: PeakWindowDraft
+  disabled: boolean
+  t: CostSettingsSectionProps['t']
+  onChange: (uid: number, mutate: (w: PeakWindowDraft) => void) => void
+  onRemove: (uid: number) => void
+}) {
+  const { window, disabled, t, onChange, onRemove } = props
+  return (
+    <div className={css.peakWindowRow}>
+      <label className={css.timeCell}>
+        <span className={css.priceLabel}>{t('models.peakStart')}</span>
+        <TimeField
+          value={window.start}
+          disabled={disabled}
+          onChange={(v) => onChange(window.uid, (w) => { w.start = v })}
+        />
+      </label>
+      <label className={css.timeCell}>
+        <span className={css.priceLabel}>{t('models.peakEnd')}</span>
+        <TimeField
+          value={window.end}
+          disabled={disabled}
+          onChange={(v) => onChange(window.uid, (w) => { w.end = v })}
+        />
+      </label>
+      <span className={css.priceGroupLabel}>{t('models.peakPrices')}</span>
+      <PriceCells
+        tier={window}
+        disabled={disabled}
+        t={t}
+        onChange={(field, value) => onChange(window.uid, (w) => { w[field] = value })}
+      />
+      <button type="button" className={css.removeButton} disabled={disabled} onClick={() => onRemove(window.uid)}>
+        {t('models.peakRemove')}
+      </button>
+    </div>
+  )
+}
+
+/** One editable per-model tier row plus its peak branch. */
 function ModelRow(props: {
   model: ModelDraft
   disabled: boolean
   t: CostSettingsSectionProps['t']
   onChangeName: (name: string) => void
   onChangePrice: (field: PriceField, value: number) => void
+  onTogglePeak: (enabled: boolean) => void
+  onChangeWindow: (uid: number, mutate: (w: PeakWindowDraft) => void) => void
+  onAddWindow: () => void
+  onRemoveWindow: (uid: number) => void
   onRemove: () => void
 }) {
-  const { model, disabled, t, onChangeName, onChangePrice, onRemove } = props
+  const {
+    model, disabled, t, onChangeName, onChangePrice, onTogglePeak,
+    onChangeWindow, onAddWindow, onRemoveWindow, onRemove,
+  } = props
   return (
-    <div className={css.modelRow}>
-      <input
-        className={css.nameInput}
-        type="text"
-        value={model.name}
-        placeholder={t('models.namePlaceholder')}
-        disabled={disabled}
-        onChange={(e) => onChangeName(e.target.value)}
-      />
-      {PRICE_FIELDS.map(({ field, labelKey }) => (
-        <label className={css.priceCell} key={field}>
-          <span className={css.priceLabel}>{t(labelKey)}</span>
-          <NumberField
-            value={model.tier[field]}
-            disabled={disabled}
-            onChange={(v) => onChangePrice(field, v)}
-          />
-        </label>
-      ))}
-      <button type="button" className={css.removeButton} disabled={disabled} onClick={onRemove}>
-        {t('models.remove')}
-      </button>
+    <div className={css.modelBlock}>
+      <div className={css.modelRow}>
+        <input
+          className={css.nameInput}
+          type="text"
+          value={model.name}
+          placeholder={t('models.namePlaceholder')}
+          disabled={disabled}
+          onChange={(e) => onChangeName(e.target.value)}
+        />
+        <span className={css.priceGroupLabel}>{t('models.basePrices')}</span>
+        <PriceCells tier={model.tier} disabled={disabled} t={t} onChange={onChangePrice} />
+        <button type="button" className={css.removeButton} disabled={disabled} onClick={onRemove}>
+          {t('models.remove')}
+        </button>
+      </div>
+
+      <label className={css.toggleRow}>
+        <input
+          type="checkbox"
+          checked={model.peakEnabled}
+          disabled={disabled}
+          onChange={(e) => onTogglePeak(e.target.checked)}
+        />
+        <span>{t('models.peakToggle')}</span>
+      </label>
+
+      {model.peakEnabled && (
+        <div className={css.peakBlock}>
+          <div className={css.blockHint}>{t('models.peakHint')}</div>
+          {model.peakWindows.map(window => (
+            <PeakWindowRow
+              key={window.uid}
+              window={window}
+              disabled={disabled}
+              t={t}
+              onChange={onChangeWindow}
+              onRemove={onRemoveWindow}
+            />
+          ))}
+          <button type="button" className={css.addButton} disabled={disabled} onClick={onAddWindow}>
+            {t('models.peakAdd')}
+          </button>
+        </div>
+      )}
     </div>
   )
 }
@@ -169,7 +311,11 @@ export function CostSettingsSection({ t, useConfig, save, reset }: CostSettingsS
       const next: CostConfigDraft = {
         currency: d.currency,
         default: { ...d.default },
-        models: d.models.map((m) => ({ ...m, tier: { ...m.tier } })),
+        models: d.models.map(m => ({
+          ...m,
+          tier: { ...m.tier },
+          peakWindows: m.peakWindows.map(w => ({ ...w })),
+        })),
       }
       mutate(next)
       return next
@@ -238,16 +384,12 @@ export function CostSettingsSection({ t, useConfig, save, reset }: CostSettingsS
         <div className={css.blockTitle}>{t('default.title')}</div>
         <div className={css.blockHint}>{t('default.hint')}</div>
         <div className={css.tierRow}>
-          {PRICE_FIELDS.map(({ field, labelKey }) => (
-            <label className={css.priceCell} key={field}>
-              <span className={css.priceLabel}>{t(labelKey)}</span>
-              <NumberField
-                value={draft.default[field]}
-                disabled={disabled}
-                onChange={(v) => setDraftField((d) => { d.default[field] = v })}
-              />
-            </label>
-          ))}
+          <PriceCells
+            tier={draft.default}
+            disabled={disabled}
+            t={t}
+            onChange={(field, value) => setDraftField((d) => { d.default[field] = value })}
+          />
           <span className={css.unit}>{t('prices.unit')}</span>
         </div>
       </div>
@@ -262,15 +404,43 @@ export function CostSettingsSection({ t, useConfig, save, reset }: CostSettingsS
             disabled={disabled}
             t={t}
             onChangeName={(name) => setDraftField((d) => {
-              const row = d.models.find((m) => m.uid === model.uid)
+              const row = d.models.find(m => m.uid === model.uid)
               if (row !== undefined) row.name = name
             })}
             onChangePrice={(field, value) => setDraftField((d) => {
-              const row = d.models.find((m) => m.uid === model.uid)
+              const row = d.models.find(m => m.uid === model.uid)
               if (row !== undefined) row.tier[field] = value
             })}
+            onTogglePeak={(enabled) => setDraftField((d) => {
+              const row = d.models.find(m => m.uid === model.uid)
+              if (row !== undefined) row.peakEnabled = enabled
+            })}
+            onChangeWindow={(uid, mutate) => setDraftField((d) => {
+              const row = d.models.find(m => m.uid === model.uid)
+              const window = row?.peakWindows.find(w => w.uid === uid)
+              if (window !== undefined) mutate(window)
+            })}
+            onAddWindow={() => setDraftField((d) => {
+              const row = d.models.find(m => m.uid === model.uid)
+              if (row === undefined) return
+              row.peakEnabled = true
+              const uid = nextUid++
+              row.peakWindows.push({
+                uid,
+                id: `peak-${uid}`,
+                start: '09:00',
+                end: '21:00',
+                cacheHitPrice: row.tier.cacheHitPrice,
+                cacheMissPrice: row.tier.cacheMissPrice,
+                outputPrice: row.tier.outputPrice,
+              })
+            })}
+            onRemoveWindow={(uid) => setDraftField((d) => {
+              const row = d.models.find(m => m.uid === model.uid)
+              if (row !== undefined) row.peakWindows = row.peakWindows.filter(w => w.uid !== uid)
+            })}
             onRemove={() => setDraftField((d) => {
-              d.models = d.models.filter((m) => m.uid !== model.uid)
+              d.models = d.models.filter(m => m.uid !== model.uid)
             })}
           />
         ))}
@@ -279,7 +449,13 @@ export function CostSettingsSection({ t, useConfig, save, reset }: CostSettingsS
           className={css.addButton}
           disabled={disabled}
           onClick={() => setDraftField((d) => {
-            d.models.push({ uid: nextUid++, name: '', tier: { ...d.default } })
+            d.models.push({
+              uid: nextUid++,
+              name: '',
+              tier: basePrices(d.default),
+              peakEnabled: false,
+              peakWindows: [],
+            })
           })}
         >
           {t('models.add')}

@@ -1,7 +1,7 @@
 {
   "name": "dsh-cost-meter",
-  "description": "Append an estimated token cost (cache hit / cache miss / output, per 1M tokens, ¥ or $) to the chat stats line in the DeepSeek Harness Web GUI",
-  "version": "0.1.0",
+  "description": "Per-step token cost ledger with optional peak/off-peak pricing for the DeepSeek Harness Web GUI (cache hit / miss / output, per 1M tokens, ¥ or $)",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "main": "./index.mjs",
