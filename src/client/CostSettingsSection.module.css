@@ -200,7 +200,10 @@
 .nameInput:disabled,
 .timeInput:disabled,
 .addButton:disabled,
-.removeButton:disabled {
+.removeButton:disabled,
+.dayButton:disabled,
+.dayButtonActive:disabled,
+.dayPreset:disabled {
   opacity: 0.6;
   cursor: default;
 }
@@ -211,7 +214,10 @@
 .timeInput:focus-visible,
 .button:focus-visible,
 .addButton:focus-visible,
-.removeButton:focus-visible {
+.removeButton:focus-visible,
+.dayButton:focus-visible,
+.dayButtonActive:focus-visible,
+.dayPreset:focus-visible {
   outline: 2px solid var(--dsw-alias-label-tertiary);
   outline-offset: -2px;
 }
@@ -270,9 +276,90 @@
 
 .peakWindowRow {
   display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+}
+
+.timeRow {
+  display: flex;
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
+}
+
+.priceRow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.dayRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.dayButtons {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.dayButton,
+.dayButtonActive {
+  box-sizing: border-box;
+  min-width: 30px;
+  height: 26px;
+  padding: 0 6px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+}
+
+.dayButtonActive {
+  border-color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+  font-weight: 500;
+}
+
+.dayButton:hover:not(:disabled),
+.dayButtonActive:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.dayPreset {
+  box-sizing: border-box;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px dashed var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-caption);
+  cursor: pointer;
+}
+
+.dayPreset:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.dayWarning {
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-state-error-primary);
 }
 
 .timeCell {

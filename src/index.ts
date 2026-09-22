@@ -28,15 +28,15 @@
 import z from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import type { CostConfig, PriceTier } from './pricing.ts'
+import { DEFAULT_PEAK_DAYS, type CostConfig, type PriceTier } from './pricing.ts'
 import {
   CostLedgerRuntime,
   type StorageDomainLike,
   type WorkspaceRegistryLike,
 } from './ledger-runtime.ts'
 
-export { CURRENCY_SYMBOLS } from './pricing.ts'
-export type { CostConfig, PeakWindow, PriceTier } from './pricing.ts'
+export { CURRENCY_SYMBOLS, DEFAULT_PEAK_DAYS, WEEKDAYS } from './pricing.ts'
+export type { CostConfig, PeakWindow, PriceTier, Weekday } from './pricing.ts'
 
 /**
  * Structural faces of the host services this plugin consumes. Declared
@@ -84,17 +84,54 @@ export type Currency = typeof CURRENCIES[number]
 const TIME_SCHEMA = z.string().pattern(/^([01]\d|2[0-3]):[0-5]\d$/)
 
 /**
- * Shipped default pricing, in CNY per 1M tokens. The `default` tier mirrors
- * `deepseek-v4-pro` (input hit ¥0.025 / input miss ¥3 / output ¥6), and
- * `models` seeds the two current DeepSeek V4 models. No peak branch ships
- * enabled.
+ * Official DeepSeek peak spans in Beijing time: 09:00–12:00 and 14:00–18:00 on
+ * workdays. Off-peak is everything else, including weekends and holidays.
+ * Source: https://api-docs.deepseek.com/zh-cn/quick_start/pricing
+ */
+const DEFAULT_PEAK_SPANS = [
+  { id: 'peak-morning', start: '09:00', end: '12:00' },
+  { id: 'peak-afternoon', start: '14:00', end: '18:00' },
+] as const
+
+/** Shipped off-peak prices in CNY per 1M tokens, from the official price table. */
+const FLASH_OFF_PEAK = { cacheHitPrice: 0.02, cacheMissPrice: 1, outputPrice: 4 }
+const PRO_OFF_PEAK = { cacheHitPrice: 0.15, cacheMissPrice: 4.5, outputPrice: 13.5 }
+
+/**
+ * Build one shipped tier: the off-peak prices plus the official peak spans on
+ * Monday–Friday. The documented peak price is exactly twice the off-peak price,
+ * so the branches are derived rather than transcribed.
+ */
+function defaultTier(offPeak: { cacheHitPrice: number; cacheMissPrice: number; outputPrice: number }): PriceTier {
+  return {
+    ...offPeak,
+    peakWindows: DEFAULT_PEAK_SPANS.map(span => ({
+      id: span.id,
+      start: span.start,
+      end: span.end,
+      days: [...DEFAULT_PEAK_DAYS],
+      cacheHitPrice: offPeak.cacheHitPrice * 2,
+      cacheMissPrice: offPeak.cacheMissPrice * 2,
+      outputPrice: offPeak.outputPrice * 2,
+    })),
+  }
+}
+
+/**
+ * Shipped default pricing, in CNY per 1M tokens, matching the current official
+ * table (deepseek-flash and deepseek-v4-pro) with peak pricing enabled for the
+ * documented weekday windows. The `default` tier mirrors `deepseek-v4-pro`, and
+ * the two retired Flash ids are kept mapped to Flash prices because the official
+ * notes still bill them as Flash.
  */
 export const DEFAULT_COST_CONFIG: CostConfig = {
   currency: 'CNY',
-  default: { cacheHitPrice: 0.025, cacheMissPrice: 3, outputPrice: 6, peakWindows: [] },
+  default: defaultTier(PRO_OFF_PEAK),
   models: {
-    'deepseek-v4-flash': { cacheHitPrice: 0.02, cacheMissPrice: 1, outputPrice: 2, peakWindows: [] },
-    'deepseek-v4-pro': { cacheHitPrice: 0.025, cacheMissPrice: 3, outputPrice: 6, peakWindows: [] },
+    'deepseek-flash': defaultTier(FLASH_OFF_PEAK),
+    'deepseek-v4-pro': defaultTier(PRO_OFF_PEAK),
+    'deepseek-v4-flash': defaultTier(FLASH_OFF_PEAK),
+    'deepseek-v4-flash-vision-exp': defaultTier(FLASH_OFF_PEAK),
   },
 }
 
@@ -103,6 +140,8 @@ const PeakWindowSchema = z.object({
   id: z.string().pattern(/^[A-Za-z0-9._:-]+$/).required(),
   start: TIME_SCHEMA.required(),
   end: TIME_SCHEMA.required(),
+  days: z.array(z.number().step(1).min(1).max(7)).default([...DEFAULT_PEAK_DAYS])
+    .description('Weekdays (ISO 1 = Monday … 7 = Sunday) this window bills on; empty disables it.'),
   cacheHitPrice: z.number().min(0).default(0),
   cacheMissPrice: z.number().min(0).default(0),
   outputPrice: z.number().min(0).default(0),

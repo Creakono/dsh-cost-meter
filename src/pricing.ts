@@ -23,9 +23,27 @@ export interface PriceValues {
   outputPrice: number
 }
 
+/** ISO weekday numbers: 1 = Monday … 7 = Sunday. */
+export const WEEKDAYS = [1, 2, 3, 4, 5, 6, 7] as const
+
+/** One ISO weekday number (1 = Monday … 7 = Sunday). */
+export type Weekday = typeof WEEKDAYS[number]
+
+/**
+ * Weekdays a peak window applies to by default: Monday–Friday. This is the
+ * official DeepSeek peak schedule (工作日 09:00–12:00 / 14:00–18:00), and it is
+ * also what every window written before weekday selection existed resolves to.
+ */
+export const DEFAULT_PEAK_DAYS: readonly Weekday[] = [1, 2, 3, 4, 5]
+
 /**
  * One optional peak-time branch. Times are local `HH:mm` strings; a window
  * with `start > end` crosses midnight. Prices are per 1,000,000 tokens.
+ *
+ * `days` selects the weekdays the window is billed on. An overnight window
+ * belongs to the weekday it starts on, so a 22:00–06:00 window enabled for
+ * Friday also covers the early hours of Saturday. An empty `days` list means
+ * the window never applies (an explicit way to park a branch).
  */
 export interface PeakWindow extends PriceValues {
   /** Stable id used to tag ledger entries billed through this window. */
@@ -34,6 +52,8 @@ export interface PeakWindow extends PriceValues {
   start: string
   /** Local end time, `HH:mm` (exclusive). */
   end: string
+  /** Weekdays (ISO 1–7) the window applies to; empty means "never". */
+  days: number[]
 }
 
 /**
@@ -88,17 +108,73 @@ function minutesOfTime(time: string): number {
   return Number(match[1]) * 60 + Number(match[2])
 }
 
-/** True when `time` (epoch ms, local time) is inside the `[start, end)` window. */
-function isInWindow(time: number, start: string, end: string): boolean {
-  const startMinutes = minutesOfTime(start)
-  const endMinutes = minutesOfTime(end)
+/** ISO weekday of a local date: 1 = Monday … 7 = Sunday. */
+export function weekdayOf(date: Date): Weekday {
+  const day = date.getDay()
+  return (day === 0 ? 7 : day) as Weekday
+}
+
+/** The weekday before `weekday`, wrapping Sunday back to Saturday. */
+function previousWeekday(weekday: Weekday): Weekday {
+  return (weekday === 1 ? 7 : weekday - 1) as Weekday
+}
+
+/** Normalize one configured day list: integers 1–7, de-duplicated and sorted. */
+export function normalizeDays(days: readonly number[] | undefined): number[] {
+  if (days === undefined) return []
+  const seen = new Set<number>()
+  for (const day of days) {
+    if (Number.isSafeInteger(day) && day >= 1 && day <= 7) seen.add(day)
+  }
+  return [...seen].sort((left, right) => left - right)
+}
+
+/**
+ * Whether one window is active at `time` (epoch ms, local time), honoring both
+ * its time span and its weekday selection. A window with `start < end` is a
+ * plain same-day span; one with `start > end` crosses midnight and is charged
+ * to the weekday it started on.
+ * @param window - the window whose span and days are checked.
+ * @param time - billing instant.
+ * @returns true when the instant bills at this window's prices.
+ */
+export function isWindowActiveAt(window: PeakWindow, time: number): boolean {
+  const startMinutes = minutesOfTime(window.start)
+  const endMinutes = minutesOfTime(window.end)
   if (!Number.isFinite(startMinutes) || !Number.isFinite(endMinutes) || startMinutes === endMinutes) {
     return false
   }
+  const days = normalizeDays(window.days)
+  if (days.length === 0) return false
   const date = new Date(time)
   const minutes = date.getHours() * 60 + date.getMinutes()
-  if (startMinutes < endMinutes) return minutes >= startMinutes && minutes < endMinutes
-  return minutes >= startMinutes || minutes < endMinutes
+  const weekday = weekdayOf(date)
+  if (startMinutes < endMinutes) {
+    return minutes >= startMinutes && minutes < endMinutes && days.includes(weekday)
+  }
+  // Overnight: the pre-midnight part belongs to today, the post-midnight part
+  // to the window that started yesterday.
+  if (minutes >= startMinutes) return days.includes(weekday)
+  if (minutes < endMinutes) return days.includes(previousWeekday(weekday))
+  return false
+}
+
+/**
+ * Group selected weekdays into inclusive ISO ranges for compact display
+ * (`[1,2,3,4,5]` → `[[1,5]]`). A Sunday-first run such as `[6,7,1]` is not
+ * wrapped: the calendar week ends on Sunday.
+ * @param days - configured day numbers (any order, duplicates allowed).
+ * @returns inclusive `[first, last]` ranges in ascending order.
+ */
+export function dayRanges(days: readonly number[]): Array<readonly [number, number]> {
+  const normalized = normalizeDays(days)
+  const ranges: Array<[number, number]> = []
+  for (const day of normalized) {
+    const last = ranges.at(-1)
+    if (last !== undefined && day === last[1] + 1) last[1] = day
+    else ranges.push([day, day])
+  }
+  return ranges
 }
 
 /**
@@ -109,7 +185,7 @@ function isInWindow(time: number, start: string, end: string): boolean {
  */
 export function activePeakWindow(tier: PriceTier, time: number): PeakWindow | null {
   for (const window of tier.peakWindows) {
-    if (isInWindow(time, window.start, window.end)) return window
+    if (isWindowActiveAt(window, time)) return window
   }
   return null
 }

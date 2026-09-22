@@ -1,7 +1,7 @@
 {
   "name": "dsh-cost-meter",
-  "description": "Per-step token cost ledger with optional peak/off-peak pricing for the DeepSeek Harness Web GUI (cache hit / miss / output, per 1M tokens, ¥ or $)",
-  "version": "0.2.0",
+  "description": "Per-step token cost ledger with peak/off-peak pricing and weekday-selected peak windows for the DeepSeek Harness Web GUI (cache hit / miss / output, per 1M tokens, ¥ or $)",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "main": "./index.mjs",
@@ -28,15 +28,16 @@
     "client": {
       "platform": "web",
       "inject": [
-        "@deepseek-ai/dsh-client-runtime",
         "@deepseek-ai/dsh-client-locale",
-        "@deepseek-ai/dsh-client-ui-settings",
-        "@deepseek-ai/dsh-client-ui-settings-general"
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-settings"
       ]
     }
   },
   "scripts": {
-    "build": "node ./scripts/build.mjs"
+    "build": "node ./scripts/build.mjs",
+    "test": "node ./scripts/test.mjs"
   },
   "license": "MIT"
 }

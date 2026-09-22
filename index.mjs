@@ -796,21 +796,72 @@ const CURRENCY_SYMBOLS = {
 	CNY: "¥",
 	USD: "$"
 };
+/** ISO weekday numbers: 1 = Monday … 7 = Sunday. */
+const WEEKDAYS = [
+	1,
+	2,
+	3,
+	4,
+	5,
+	6,
+	7
+];
+/**
+* Weekdays a peak window applies to by default: Monday–Friday. This is the
+* official DeepSeek peak schedule (工作日 09:00–12:00 / 14:00–18:00), and it is
+* also what every window written before weekday selection existed resolves to.
+*/
+const DEFAULT_PEAK_DAYS = [
+	1,
+	2,
+	3,
+	4,
+	5
+];
 /** Minutes since local midnight. */
 function minutesOfTime(time) {
 	const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(time);
 	if (match === null) return NaN;
 	return Number(match[1]) * 60 + Number(match[2]);
 }
-/** True when `time` (epoch ms, local time) is inside the `[start, end)` window. */
-function isInWindow(time, start, end) {
-	const startMinutes = minutesOfTime(start);
-	const endMinutes = minutesOfTime(end);
+/** ISO weekday of a local date: 1 = Monday … 7 = Sunday. */
+function weekdayOf(date) {
+	const day = date.getDay();
+	return day === 0 ? 7 : day;
+}
+/** The weekday before `weekday`, wrapping Sunday back to Saturday. */
+function previousWeekday(weekday) {
+	return weekday === 1 ? 7 : weekday - 1;
+}
+/** Normalize one configured day list: integers 1–7, de-duplicated and sorted. */
+function normalizeDays(days) {
+	if (days === void 0) return [];
+	const seen = /* @__PURE__ */ new Set();
+	for (const day of days) if (Number.isSafeInteger(day) && day >= 1 && day <= 7) seen.add(day);
+	return [...seen].sort((left, right) => left - right);
+}
+/**
+* Whether one window is active at `time` (epoch ms, local time), honoring both
+* its time span and its weekday selection. A window with `start < end` is a
+* plain same-day span; one with `start > end` crosses midnight and is charged
+* to the weekday it started on.
+* @param window - the window whose span and days are checked.
+* @param time - billing instant.
+* @returns true when the instant bills at this window's prices.
+*/
+function isWindowActiveAt(window, time) {
+	const startMinutes = minutesOfTime(window.start);
+	const endMinutes = minutesOfTime(window.end);
 	if (!Number.isFinite(startMinutes) || !Number.isFinite(endMinutes) || startMinutes === endMinutes) return false;
+	const days = normalizeDays(window.days);
+	if (days.length === 0) return false;
 	const date = new Date(time);
 	const minutes = date.getHours() * 60 + date.getMinutes();
-	if (startMinutes < endMinutes) return minutes >= startMinutes && minutes < endMinutes;
-	return minutes >= startMinutes || minutes < endMinutes;
+	const weekday = weekdayOf(date);
+	if (startMinutes < endMinutes) return minutes >= startMinutes && minutes < endMinutes && days.includes(weekday);
+	if (minutes >= startMinutes) return days.includes(weekday);
+	if (minutes < endMinutes) return days.includes(previousWeekday(weekday));
+	return false;
 }
 /**
 * The active peak window for one tier at `time` (epoch ms, local time).
@@ -819,7 +870,7 @@ function isInWindow(time, start, end) {
 * @returns the first matching window, or null.
 */
 function activePeakWindow(tier, time) {
-	for (const window of tier.peakWindows) if (isInWindow(time, window.start, window.end)) return window;
+	for (const window of tier.peakWindows) if (isWindowActiveAt(window, time)) return window;
 	return null;
 }
 /**
@@ -887,7 +938,7 @@ function entryKey(turn, step) {
 function usageSampleOf(event) {
 	const data = event.data;
 	if (data === null || data === void 0) return null;
-	const usage = event.type === "assistant/chunk" && data.chunk?.type === "usage" ? data.chunk?.usage : event.type === "assistant/message" ? data.usage : void 0;
+	const usage = usageCarriedBy(event.type, data);
 	if (usage === void 0) return null;
 	const turn = Number(data.turn);
 	const step = Number(data.step);
@@ -898,6 +949,32 @@ function usageSampleOf(event) {
 		step,
 		buckets
 	};
+}
+/**
+* The provider usage one committed event carries, across the carriers the
+* harness has used: a settlement's own `usage` field, the last `usage` chunk
+* embedded in its compact stream, or (pre-V3 logs) a dedicated streaming event.
+* @param type - committed event type.
+* @param data - committed event payload.
+* @returns the raw provider usage, or undefined when the event reports none.
+*/
+function usageCarriedBy(type, data) {
+	if (type === "assistant/message" && data.usage !== void 0) return data.usage;
+	if (type === "assistant/message" || type === "assistant/attempt") return lastStreamUsage(data.stream);
+	if (type === "assistant/chunk") {
+		const chunk = data.chunk;
+		if (isPlainObject$1(chunk) && chunk.type === "usage") return chunk.usage;
+	}
+}
+/** The last raw `usage` chunk of a compact Assistant stream, if it has one. */
+function lastStreamUsage(stream) {
+	if (!Array.isArray(stream)) return void 0;
+	for (let index = stream.length - 1; index >= 0; index -= 1) {
+		const record = stream[index];
+		if (!isPlainObject$1(record) || record.type !== "chunk") continue;
+		const chunk = record.chunk;
+		if (isPlainObject$1(chunk) && chunk.type === "usage" && chunk.usage !== void 0) return chunk.usage;
+	}
 }
 function bucketsOf(usage) {
 	if (!isPlainObject$1(usage)) return null;
@@ -919,6 +996,32 @@ function modelOf(event) {
 	if (event.type !== "request/header") return null;
 	const model = event.data?.header?.config?.model;
 	return typeof model === "string" && model !== "" ? model : null;
+}
+/**
+* Read the committed events before `untilSeq` from whatever read API the live
+* session exposes. The harness renamed this read once already (`events` array →
+* `snapshotEvents`), and a missing property must never throw inside an event
+* observer: an unknown session shape degrades to "no prior model".
+* @param session - live session receiving the current event.
+* @param untilSeq - exclusive upper bound: the sequence number of the event being folded.
+* @returns committed events in log order, or an empty list when unreadable.
+*/
+function priorEventsOf(session, untilSeq) {
+	if (typeof session.snapshotEvents === "function") try {
+		const slice = session.snapshotEvents(0, untilSeq);
+		if (Array.isArray(slice)) return slice;
+	} catch {}
+	if (Array.isArray(session.events)) return session.events;
+	if (typeof session.eventAt === "function") {
+		const collected = [];
+		for (let seq = 0; seq < untilSeq; seq += 1) {
+			const event = session.eventAt(seq);
+			if (event === void 0) break;
+			collected.push(event);
+		}
+		return collected;
+	}
+	return [];
 }
 /** Seed a fold from the committed prefix WITHOUT generating entries (no backfill). */
 function seedFold(events, untilSeq) {
@@ -1125,6 +1228,8 @@ var CostLedgerRuntime = class {
 	folds = /* @__PURE__ */ new WeakMap();
 	tails = /* @__PURE__ */ new Map();
 	allTails = /* @__PURE__ */ new Set();
+	/** Distinct observation failures already logged (one line per cause). */
+	reportedFailures = /* @__PURE__ */ new Set();
 	constructor(ctx, readConfig) {
 		this.ctx = ctx;
 		this.readConfig = readConfig;
@@ -1215,30 +1320,41 @@ var CostLedgerRuntime = class {
 	}
 	onEvent(session, event) {
 		if (this.closed) return;
-		let state = this.folds.get(session);
-		if (state === void 0) state = seedFold(session.events, event.seq);
-		const next = foldModel(state, event);
-		if (next !== state) this.folds.set(session, next);
-		const sample = usageSampleOf(event);
-		if (sample === null) return;
-		const config = this.readConfig();
-		if (config === void 0) return;
-		const entry = buildCostEntry(config, next.model, sample, event.time);
-		this.enqueue(session.id, async () => {
-			if (this.closed) return;
-			try {
-				await this.ready;
-			} catch {
-				return;
-			}
-			if (this.table === void 0) return;
-			const current = this.table.get(session.id) ?? {
-				sessionId: session.id,
-				entries: {}
-			};
-			const updated = applyEntry(current, entry);
-			if (updated !== current) await this.table.put(session.id, updated);
-		});
+		try {
+			let state = this.folds.get(session);
+			if (state === void 0) state = seedFold(priorEventsOf(session, event.seq), event.seq);
+			const next = foldModel(state, event);
+			if (next !== state) this.folds.set(session, next);
+			const sample = usageSampleOf(event);
+			if (sample === null) return;
+			const config = this.readConfig();
+			if (config === void 0) return;
+			const entry = buildCostEntry(config, next.model, sample, event.time);
+			this.enqueue(session.id, async () => {
+				if (this.closed) return;
+				try {
+					await this.ready;
+				} catch {
+					return;
+				}
+				if (this.table === void 0) return;
+				const current = this.table.get(session.id) ?? {
+					sessionId: session.id,
+					entries: {}
+				};
+				const updated = applyEntry(current, entry);
+				if (updated !== current) await this.table.put(session.id, updated);
+			});
+		} catch (error) {
+			this.reportObservationFailure(error);
+		}
+	}
+	/** Log the first distinct observation failure; later repeats stay quiet. */
+	reportObservationFailure(error) {
+		const message = `dsh-cost-meter: cost observation failed: ${String(error)}`;
+		if (this.reportedFailures.has(message)) return;
+		this.reportedFailures.add(message);
+		this.ctx.logger.warn(message);
 	}
 	/** Serialize one session's ledger mutations (per-session tail; the domain chain also serializes). */
 	enqueue(sessionId, job) {
@@ -1306,32 +1422,64 @@ const CURRENCIES = ["CNY", "USD"];
 /** Local `HH:mm` window time. */
 const TIME_SCHEMA = Schema.string().pattern(/^([01]\d|2[0-3]):[0-5]\d$/);
 /**
-* Shipped default pricing, in CNY per 1M tokens. The `default` tier mirrors
-* `deepseek-v4-pro` (input hit ¥0.025 / input miss ¥3 / output ¥6), and
-* `models` seeds the two current DeepSeek V4 models. No peak branch ships
-* enabled.
+* Official DeepSeek peak spans in Beijing time: 09:00–12:00 and 14:00–18:00 on
+* workdays. Off-peak is everything else, including weekends and holidays.
+* Source: https://api-docs.deepseek.com/zh-cn/quick_start/pricing
+*/
+const DEFAULT_PEAK_SPANS = [{
+	id: "peak-morning",
+	start: "09:00",
+	end: "12:00"
+}, {
+	id: "peak-afternoon",
+	start: "14:00",
+	end: "18:00"
+}];
+/** Shipped off-peak prices in CNY per 1M tokens, from the official price table. */
+const FLASH_OFF_PEAK = {
+	cacheHitPrice: .02,
+	cacheMissPrice: 1,
+	outputPrice: 4
+};
+const PRO_OFF_PEAK = {
+	cacheHitPrice: .15,
+	cacheMissPrice: 4.5,
+	outputPrice: 13.5
+};
+/**
+* Build one shipped tier: the off-peak prices plus the official peak spans on
+* Monday–Friday. The documented peak price is exactly twice the off-peak price,
+* so the branches are derived rather than transcribed.
+*/
+function defaultTier(offPeak) {
+	return {
+		...offPeak,
+		peakWindows: DEFAULT_PEAK_SPANS.map((span) => ({
+			id: span.id,
+			start: span.start,
+			end: span.end,
+			days: [...DEFAULT_PEAK_DAYS],
+			cacheHitPrice: offPeak.cacheHitPrice * 2,
+			cacheMissPrice: offPeak.cacheMissPrice * 2,
+			outputPrice: offPeak.outputPrice * 2
+		}))
+	};
+}
+/**
+* Shipped default pricing, in CNY per 1M tokens, matching the current official
+* table (deepseek-flash and deepseek-v4-pro) with peak pricing enabled for the
+* documented weekday windows. The `default` tier mirrors `deepseek-v4-pro`, and
+* the two retired Flash ids are kept mapped to Flash prices because the official
+* notes still bill them as Flash.
 */
 const DEFAULT_COST_CONFIG = {
 	currency: "CNY",
-	default: {
-		cacheHitPrice: .025,
-		cacheMissPrice: 3,
-		outputPrice: 6,
-		peakWindows: []
-	},
+	default: defaultTier(PRO_OFF_PEAK),
 	models: {
-		"deepseek-v4-flash": {
-			cacheHitPrice: .02,
-			cacheMissPrice: 1,
-			outputPrice: 2,
-			peakWindows: []
-		},
-		"deepseek-v4-pro": {
-			cacheHitPrice: .025,
-			cacheMissPrice: 3,
-			outputPrice: 6,
-			peakWindows: []
-		}
+		"deepseek-flash": defaultTier(FLASH_OFF_PEAK),
+		"deepseek-v4-pro": defaultTier(PRO_OFF_PEAK),
+		"deepseek-v4-flash": defaultTier(FLASH_OFF_PEAK),
+		"deepseek-v4-flash-vision-exp": defaultTier(FLASH_OFF_PEAK)
 	}
 };
 /** One optional peak-time branch, editable per model. */
@@ -1339,6 +1487,7 @@ const PeakWindowSchema = Schema.object({
 	id: Schema.string().pattern(/^[A-Za-z0-9._:-]+$/).required(),
 	start: TIME_SCHEMA.required(),
 	end: TIME_SCHEMA.required(),
+	days: Schema.array(Schema.number().step(1).min(1).max(7)).default([...DEFAULT_PEAK_DAYS]).description("Weekdays (ISO 1 = Monday … 7 = Sunday) this window bills on; empty disables it."),
 	cacheHitPrice: Schema.number().min(0).default(0),
 	cacheMissPrice: Schema.number().min(0).default(0),
 	outputPrice: Schema.number().min(0).default(0)
@@ -1533,4 +1682,4 @@ function apply(ctx, config) {
 	}), "dsh-cost-meter: config routes");
 }
 //#endregion
-export { CURRENCIES, CURRENCY_SYMBOLS, Config, DEFAULT_COST_CONFIG, SETTINGS_NAMESPACE, apply, inject, name };
+export { CURRENCIES, CURRENCY_SYMBOLS, Config, DEFAULT_COST_CONFIG, DEFAULT_PEAK_DAYS, SETTINGS_NAMESPACE, WEEKDAYS, apply, inject, name };

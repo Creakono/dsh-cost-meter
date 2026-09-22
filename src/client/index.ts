@@ -13,9 +13,12 @@
  * expose third-party settings namespaces to the browser.
  */
 import { useSyncExternalStore } from 'react'
-import { createSnapshotStore } from '@deepseek-ai/dsh-client-runtime/client'
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
+import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type {} from '@deepseek-ai/dsh-client-ui-slots'
+// Type-only: pulls the SlotRegistry service merge (ctx.slots), which ui-renderer
+// owns; ui-slots itself only carries the registration semantics.
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'

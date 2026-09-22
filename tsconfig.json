@@ -23,7 +23,7 @@
       "path": "./.dsh/vendor/schemastery"
     },
     {
-      "path": "./.dsh/packages/client/runtime"
+      "path": "./.dsh/packages/client/store"
     },
     {
       "path": "./.dsh/packages/client/ui-slots"

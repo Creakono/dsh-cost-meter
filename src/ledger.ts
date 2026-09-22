@@ -30,10 +30,20 @@ export interface LedgerEventLike {
   data: unknown
 }
 
-/** Minimal live-session shape the ledger folds. */
+/**
+ * Minimal live-session shape the ledger folds. Only the committed-prefix read
+ * is needed, and the harness has shipped that read in more than one spelling:
+ * current sessions expose {@link LedgerSessionLike.snapshotEvents}, older ones
+ * exposed the raw `events` array, and `eventAt` can serve as a last resort.
+ */
 export interface LedgerSessionLike {
   id: string
-  events: readonly LedgerEventLike[]
+  /** Current session API: an immutable slice of the committed log. */
+  snapshotEvents?: (fromSeq?: number, toSeqExclusive?: number) => readonly LedgerEventLike[]
+  /** Legacy sessions exposed the raw append-only log as an array. */
+  events?: readonly LedgerEventLike[]
+  /** Random access to one committed event by sequence number. */
+  eventAt?: (seq: number) => LedgerEventLike | undefined
 }
 
 /** One immutable per-step cost entry. */
@@ -105,13 +115,10 @@ export function usageSampleOf(event: LedgerEventLike): UsageSample | null {
     step?: unknown
     chunk?: { type?: unknown; usage?: unknown }
     usage?: unknown
+    stream?: unknown
   } | null | undefined
   if (data === null || data === undefined) return null
-  const usage = event.type === 'assistant/chunk' && (data.chunk as { type?: unknown } | undefined)?.type === 'usage'
-    ? (data.chunk as { usage?: unknown } | undefined)?.usage
-    : event.type === 'assistant/message'
-      ? data.usage
-      : undefined
+  const usage = usageCarriedBy(event.type, data)
   if (usage === undefined) return null
   const turn = Number(data.turn)
   const step = Number(data.step)
@@ -120,6 +127,38 @@ export function usageSampleOf(event: LedgerEventLike): UsageSample | null {
     return null
   }
   return { turn, step, buckets }
+}
+
+/**
+ * The provider usage one committed event carries, across the carriers the
+ * harness has used: a settlement's own `usage` field, the last `usage` chunk
+ * embedded in its compact stream, or (pre-V3 logs) a dedicated streaming event.
+ * @param type - committed event type.
+ * @param data - committed event payload.
+ * @returns the raw provider usage, or undefined when the event reports none.
+ */
+function usageCarriedBy(type: string, data: Record<string, unknown>): unknown {
+  if (type === 'assistant/message' && data.usage !== undefined) return data.usage
+  if (type === 'assistant/message' || type === 'assistant/attempt') {
+    return lastStreamUsage(data.stream)
+  }
+  if (type === 'assistant/chunk') {
+    const chunk = data.chunk
+    if (isPlainObject(chunk) && chunk.type === 'usage') return chunk.usage
+  }
+  return undefined
+}
+
+/** The last raw `usage` chunk of a compact Assistant stream, if it has one. */
+function lastStreamUsage(stream: unknown): unknown {
+  if (!Array.isArray(stream)) return undefined
+  for (let index = stream.length - 1; index >= 0; index -= 1) {
+    const record = stream[index]
+    if (!isPlainObject(record) || record.type !== 'chunk') continue
+    const chunk = record.chunk
+    if (isPlainObject(chunk) && chunk.type === 'usage' && chunk.usage !== undefined) return chunk.usage
+  }
+  return undefined
 }
 
 function bucketsOf(usage: unknown): TokenUsageBucket | null {
@@ -146,6 +185,37 @@ export function modelOf(event: LedgerEventLike): string | null {
 /** Live fold state: only the latest model route matters for post-upgrade events. */
 export interface SessionFold {
   model: string | null
+}
+
+/**
+ * Read the committed events before `untilSeq` from whatever read API the live
+ * session exposes. The harness renamed this read once already (`events` array →
+ * `snapshotEvents`), and a missing property must never throw inside an event
+ * observer: an unknown session shape degrades to "no prior model".
+ * @param session - live session receiving the current event.
+ * @param untilSeq - exclusive upper bound: the sequence number of the event being folded.
+ * @returns committed events in log order, or an empty list when unreadable.
+ */
+export function priorEventsOf(session: LedgerSessionLike, untilSeq: number): readonly LedgerEventLike[] {
+  if (typeof session.snapshotEvents === 'function') {
+    try {
+      const slice = session.snapshotEvents(0, untilSeq)
+      if (Array.isArray(slice)) return slice
+    } catch {
+      // Fall through to the older read shapes below.
+    }
+  }
+  if (Array.isArray(session.events)) return session.events
+  if (typeof session.eventAt === 'function') {
+    const collected: LedgerEventLike[] = []
+    for (let seq = 0; seq < untilSeq; seq += 1) {
+      const event = session.eventAt(seq)
+      if (event === undefined) break
+      collected.push(event)
+    }
+    return collected
+  }
+  return []
 }
 
 /** Seed a fold from the committed prefix WITHOUT generating entries (no backfill). */

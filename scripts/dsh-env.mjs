@@ -39,7 +39,7 @@ async function ensureSymlink(path, target, ownedLinks) {
 
 async function prepareLinks(dshRoot) {
   const ownedLinks = []
-  const clientModules = join(dshRoot, 'packages/client/runtime/node_modules')
+  const clientModules = join(dshRoot, 'packages/client/web/node_modules')
   let removeNodeModules = false
   try {
     await lstat(join(pluginRoot, 'node_modules'))
@@ -49,7 +49,6 @@ async function prepareLinks(dshRoot) {
   }
   await ensureSymlink(join(pluginRoot, '.dsh'), dshRoot, ownedLinks)
   await ensureSymlink(join(pluginRoot, 'node_modules/react'), join(clientModules, 'react'), ownedLinks)
-  await ensureSymlink(join(pluginRoot, 'node_modules/cordis'), join(clientModules, 'cordis'), ownedLinks)
   await ensureSymlink(join(pluginRoot, 'node_modules/@types'), join(clientModules, '@types'), ownedLinks)
   return { ownedLinks, removeNodeModules }
 }
@@ -62,8 +61,12 @@ async function removeOwnedLinks(ownedLinks, removeNodeModules) {
 export async function withDshEnvironment(task) {
   const dshRoot = dshRootFromEnvironment()
   await requirePath(join(dshRoot, 'packages/client/tsdown.client.ts'), 'DSH client bundle preset')
+  await requirePath(join(dshRoot, 'packages/client/web/src/platform.ts'), 'DSH client platform module table')
   await requirePath(binPath(dshRoot, 'tsdown'), 'DSH tsdown executable')
   await requirePath(binPath(dshRoot, 'tsc'), 'DSH TypeScript executable')
+  // The build faces read this to resolve harness-owned build dependencies
+  // (lightningcss) and the platform module table from the linked checkout.
+  process.env.DSH_ROOT = dshRoot
   const { ownedLinks, removeNodeModules } = await prepareLinks(dshRoot)
   try {
     return await task({ dshRoot, pluginRoot })

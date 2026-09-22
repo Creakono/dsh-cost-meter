@@ -10,6 +10,7 @@ import {
   buildCostEntry,
   foldModel,
   LEDGER_DOMAIN_SPEC,
+  priorEventsOf,
   seedFold,
   snapshotRecord,
   usageSampleOf,
@@ -85,6 +86,8 @@ export class CostLedgerRuntime {
   private readonly folds = new WeakMap<object, SessionFold>()
   private readonly tails = new Map<string, SettledTail>()
   private readonly allTails = new Set<SettledTail>()
+  /** Distinct observation failures already logged (one line per cause). */
+  private readonly reportedFailures = new Set<string>()
 
   constructor(
     private readonly ctx: LedgerRuntimeContextLike,
@@ -193,29 +196,44 @@ export class CostLedgerRuntime {
 
   private onEvent(session: LedgerSessionLike, event: LedgerEventLike): void {
     if (this.closed) return
-    let state = this.folds.get(session)
-    if (state === undefined) {
-      state = seedFold(session.events, event.seq)
-    }
-    const next = foldModel(state, event)
-    if (next !== state) this.folds.set(session, next)
-    const sample = usageSampleOf(event)
-    if (sample === null) return
-    const config = this.readConfig()
-    if (config === undefined) return
-    const entry: CostEntry = buildCostEntry(config, next.model, sample, event.time)
-    void this.enqueue(session.id, async () => {
-      if (this.closed) return
-      try {
-        await this.ready
-      } catch {
-        return
+    try {
+      let state = this.folds.get(session)
+      if (state === undefined) {
+        state = seedFold(priorEventsOf(session, event.seq), event.seq)
       }
-      if (this.table === undefined) return
-      const current = this.table.get(session.id) ?? { sessionId: session.id, entries: {} }
-      const updated = applyEntry(current, entry)
-      if (updated !== current) await this.table.put(session.id, updated)
-    })
+      const next = foldModel(state, event)
+      if (next !== state) this.folds.set(session, next)
+      const sample = usageSampleOf(event)
+      if (sample === null) return
+      const config = this.readConfig()
+      if (config === undefined) return
+      const entry: CostEntry = buildCostEntry(config, next.model, sample, event.time)
+      void this.enqueue(session.id, async () => {
+        if (this.closed) return
+        try {
+          await this.ready
+        } catch {
+          return
+        }
+        if (this.table === undefined) return
+        const current = this.table.get(session.id) ?? { sessionId: session.id, entries: {} }
+        const updated = applyEntry(current, entry)
+        if (updated !== current) await this.table.put(session.id, updated)
+      })
+    } catch (error: unknown) {
+      // A session-event observer must never escape into the append path, but a
+      // shape this plugin no longer understands must not stay silent either:
+      // warn once per cause so a broken read shows up in the log immediately.
+      this.reportObservationFailure(error)
+    }
+  }
+
+  /** Log the first distinct observation failure; later repeats stay quiet. */
+  private reportObservationFailure(error: unknown): void {
+    const message = `dsh-cost-meter: cost observation failed: ${String(error)}`
+    if (this.reportedFailures.has(message)) return
+    this.reportedFailures.add(message)
+    this.ctx.logger.warn(message)
   }
 
   /** Serialize one session's ledger mutations (per-session tail; the domain chain also serializes). */

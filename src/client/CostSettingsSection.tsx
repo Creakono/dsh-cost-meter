@@ -7,7 +7,8 @@
  */
 import { useEffect, useState } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import type { CostConfig, PeakWindow, PriceTier, PriceValues } from './pricing.ts'
+import { DEFAULT_PEAK_DAYS, normalizeDays, type CostConfig, type PeakWindow, type PriceTier, type PriceValues } from './pricing.ts'
+import { draftDays, EVERY_DAY, toggleDay, WEEKDAY_LABELS } from './days.ts'
 import css from './CostSettingsSection.module.css'
 
 /** Component props: the section runtime share, the pricing face, and the locale seat. */
@@ -29,9 +30,7 @@ const PRICE_FIELDS = [
 type PriceField = typeof PRICE_FIELDS[number]['field']
 
 /** One editable peak window (uid keeps the React key stable). */
-interface PeakWindowDraft extends PeakWindow {
-  uid: number
-}
+type PeakWindowDraft = Omit<PeakWindow, 'days'> & { uid: number; days: number[] }
 
 /** One editable per-model row (uid keeps the React key stable across renames). */
 interface ModelDraft {
@@ -78,7 +77,11 @@ function toDraft(config: CostConfig): CostConfigDraft {
       name,
       tier: basePrices(tier),
       peakEnabled: tier.peakWindows.length > 0,
-      peakWindows: tier.peakWindows.map(window => ({ ...window, uid: nextUid++ })),
+      peakWindows: tier.peakWindows.map(window => ({
+        ...window,
+        days: draftDays(window),
+        uid: nextUid++,
+      })),
     })),
   }
 }
@@ -181,6 +184,53 @@ function PriceCells(props: {
   )
 }
 
+/** The weekday multi-select of one peak window (any subset of Monday–Sunday). */
+function DayPicker(props: {
+  days: number[]
+  disabled: boolean
+  t: CostSettingsSectionProps['t']
+  onChange: (days: number[]) => void
+}) {
+  const { days, disabled, t, onChange } = props
+  const selected = new Set(normalizeDays(days))
+  return (
+    <div className={css.dayRow}>
+      <span className={css.priceLabel}>{t('models.peakDays')}</span>
+      <div className={css.dayButtons}>
+        {WEEKDAY_LABELS.map(({ day, key }) => (
+          <button
+            key={day}
+            type="button"
+            className={selected.has(day) ? css.dayButtonActive : css.dayButton}
+            aria-pressed={selected.has(day)}
+            disabled={disabled}
+            onClick={() => onChange(toggleDay(days, day))}
+          >
+            {t(key)}
+          </button>
+        ))}
+      </div>
+      <button
+        type="button"
+        className={css.dayPreset}
+        disabled={disabled}
+        onClick={() => onChange([...DEFAULT_PEAK_DAYS])}
+      >
+        {t('models.peakDaysWorkweek')}
+      </button>
+      <button
+        type="button"
+        className={css.dayPreset}
+        disabled={disabled}
+        onClick={() => onChange([...EVERY_DAY])}
+      >
+        {t('models.peakDaysEveryDay')}
+      </button>
+      {selected.size === 0 && <span className={css.dayWarning}>{t('models.peakDaysNone')}</span>}
+    </div>
+  )
+}
+
 /** One editable peak window row. */
 function PeakWindowRow(props: {
   window: PeakWindowDraft
@@ -192,32 +242,42 @@ function PeakWindowRow(props: {
   const { window, disabled, t, onChange, onRemove } = props
   return (
     <div className={css.peakWindowRow}>
-      <label className={css.timeCell}>
-        <span className={css.priceLabel}>{t('models.peakStart')}</span>
-        <TimeField
-          value={window.start}
-          disabled={disabled}
-          onChange={(v) => onChange(window.uid, (w) => { w.start = v })}
-        />
-      </label>
-      <label className={css.timeCell}>
-        <span className={css.priceLabel}>{t('models.peakEnd')}</span>
-        <TimeField
-          value={window.end}
-          disabled={disabled}
-          onChange={(v) => onChange(window.uid, (w) => { w.end = v })}
-        />
-      </label>
-      <span className={css.priceGroupLabel}>{t('models.peakPrices')}</span>
-      <PriceCells
-        tier={window}
+      <div className={css.timeRow}>
+        <label className={css.timeCell}>
+          <span className={css.priceLabel}>{t('models.peakStart')}</span>
+          <TimeField
+            value={window.start}
+            disabled={disabled}
+            onChange={(v) => onChange(window.uid, (w) => { w.start = v })}
+          />
+        </label>
+        <label className={css.timeCell}>
+          <span className={css.priceLabel}>{t('models.peakEnd')}</span>
+          <TimeField
+            value={window.end}
+            disabled={disabled}
+            onChange={(v) => onChange(window.uid, (w) => { w.end = v })}
+          />
+        </label>
+        <button type="button" className={css.removeButton} disabled={disabled} onClick={() => onRemove(window.uid)}>
+          {t('models.peakRemove')}
+        </button>
+      </div>
+      <DayPicker
+        days={window.days}
         disabled={disabled}
         t={t}
-        onChange={(field, value) => onChange(window.uid, (w) => { w[field] = value })}
+        onChange={(days) => onChange(window.uid, (w) => { w.days = days })}
       />
-      <button type="button" className={css.removeButton} disabled={disabled} onClick={() => onRemove(window.uid)}>
-        {t('models.peakRemove')}
-      </button>
+      <div className={css.priceRow}>
+        <span className={css.priceGroupLabel}>{t('models.peakPrices')}</span>
+        <PriceCells
+          tier={window}
+          disabled={disabled}
+          t={t}
+          onChange={(field, value) => onChange(window.uid, (w) => { w[field] = value })}
+        />
+      </div>
     </div>
   )
 }
@@ -430,6 +490,7 @@ export function CostSettingsSection({ t, useConfig, save, reset }: CostSettingsS
                 id: `peak-${uid}`,
                 start: '09:00',
                 end: '21:00',
+                days: [...DEFAULT_PEAK_DAYS],
                 cacheHitPrice: row.tier.cacheHitPrice,
                 cacheMissPrice: row.tier.cacheMissPrice,
                 outputPrice: row.tier.outputPrice,
